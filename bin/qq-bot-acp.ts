@@ -5,6 +5,7 @@ import { BotRuntime } from "../src/runtime.js";
 import { resolveBotPaths } from "../src/config/paths.js";
 import { ConfigStore } from "../src/config/store.js";
 import { createInitialConfig } from "../src/config/schema.js";
+import { createServiceLogger } from "../src/logging/service-logger.js";
 
 interface CliOptions {
   command: "start" | "init" | "help";
@@ -49,26 +50,37 @@ async function main(): Promise<void> {
     await store.bootstrapAdmins(options.admins);
   }
 
+  const logger = await createServiceLogger(paths.logs);
+  const log = (message: string) => logger.log(message);
   let runtime: BotRuntime | undefined;
-  const startup = await store.loadForStartup(async (config) => {
-    const candidate = await BotRuntime.create(config, store, log);
-    try {
-      await candidate.start();
-      runtime = candidate;
-    } catch (error) {
-      await candidate.stop();
-      throw error;
+  try {
+    const startup = await store.loadForStartup(async (config) => {
+      const candidate = await BotRuntime.create(config, store, log);
+      try {
+        await candidate.start();
+        runtime = candidate;
+      } catch (error) {
+        await candidate.stop();
+        throw error;
+      }
+    });
+    await store.markProven(startup.config);
+    if (startup.source === "proven") {
+      log(`Current config failed; restored proven config: ${startup.currentError?.message}`);
     }
-  });
-  await store.markProven(startup.config);
-  if (startup.source === "proven") {
-    log(`Current config failed; restored proven config: ${startup.currentError?.message}`);
+    log(`Bot ready using ${startup.source} configuration`);
+  } catch (error) {
+    await logger.close();
+    throw error;
   }
-  log(`Bot ready using ${startup.source} configuration`);
 
+  let stopping = false;
   const shutdown = async () => {
+    if (stopping) return;
+    stopping = true;
     log("Stopping...");
     await runtime?.stop();
+    await logger.close();
     process.exitCode = 0;
   };
   process.once("SIGINT", () => void shutdown());
@@ -137,10 +149,6 @@ Start:
 
 --admin-openid is accepted only while the persisted administrator list is empty.
 After startup, use /id privately to discover your bot-scoped OpenID.`);
-}
-
-function log(message: string): void {
-  console.log(`[${new Date().toISOString()}] ${message}`);
 }
 
 main().catch((error) => {

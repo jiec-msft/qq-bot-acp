@@ -54,6 +54,26 @@ export interface QQStreamMessageResponse {
   pendingCharacters?: number;
 }
 
+export class QQApiError extends Error {
+  constructor(
+    operation: string,
+    readonly status: number,
+    readonly code?: string | number,
+    readonly traceId?: string,
+  ) {
+    const details = [
+      code === undefined ? undefined : `code ${code}`,
+      traceId ? `trace ${traceId}` : undefined,
+    ].filter(Boolean);
+    super(
+      `QQ ${operation} failed (${status}${
+        details.length > 0 ? `; ${details.join("; ")}` : ""
+      })`,
+    );
+    this.name = "QQApiError";
+  }
+}
+
 export class QQApi {
   private accessToken?: string;
   private tokenExpiresAt = 0;
@@ -163,14 +183,7 @@ export class QQApi {
     });
     const result = (await response.json().catch(() => ({}))) as Record<string, unknown>;
     if (!response.ok) {
-      const code = result.code ?? result.err_code;
-      throw new Error(
-        `QQ stream send failed (${response.status}${
-          typeof code === "number" || typeof code === "string"
-            ? `; code ${code}`
-            : ""
-        })`,
-      );
+      throw qqApiError("stream send", response, result);
     }
     return parseStreamMessageResponse(result);
   }
@@ -288,4 +301,35 @@ function sanitizeQQFileName(fileName: string): string {
     .replace(/\s+/g, " ")
     .trim();
   return sanitized || "file";
+}
+
+function qqApiError(
+  operation: string,
+  response: Response,
+  result: Record<string, unknown>,
+): QQApiError {
+  const rawCode = result.code ?? result.err_code;
+  const code =
+    typeof rawCode === "number" || typeof rawCode === "string"
+      ? rawCode
+      : undefined;
+  const rawTraceId =
+    response.headers.get("x-tps-trace-id") ??
+    response.headers.get("x-request-id") ??
+    result.trace_id;
+  const traceId =
+    typeof rawTraceId === "string"
+      ? diagnosticValue(rawTraceId)
+      : undefined;
+  return new QQApiError(
+    operation,
+    response.status,
+    code,
+    traceId,
+  );
+}
+
+function diagnosticValue(value: string): string | undefined {
+  const normalized = value.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+  return normalized ? normalized.slice(0, 300) : undefined;
 }
