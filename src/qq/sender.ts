@@ -33,6 +33,8 @@ const STREAM_UPDATE_INTERVAL_MS = 300;
 const STREAM_DIAGNOSTIC_INTERVAL_MS = 1_000;
 const STREAM_EMPTY_PLACEHOLDER = "…";
 const STREAM_COMPLETION_MARKER = "\n\n🔚";
+const STREAM_RECOVERY_MARKER =
+  "QQ stream resumed after an idle timeout. The complete answer follows.\n\n";
 const TRUNCATION_NOTICE =
   "Response truncated: QQ's passive reply limit was reached.";
 let nextStreamTrace = 1;
@@ -56,7 +58,15 @@ export interface QQReplyStream {
   finish(): Promise<void>;
 }
 
+export interface QQStreamingDiagnosticOptions {
+  delayMinutes?: 1 | 3 | 5 | 10;
+  isWakeup?: boolean;
+  pause?: (milliseconds: number) => Promise<void>;
+}
+
 export class QQSender {
+  private readonly shutdown = new AbortController();
+
   constructor(
     private readonly api: QQMessageApi,
     private readonly getConfig: () => BotConfig,
@@ -72,6 +82,10 @@ export class QQSender {
     );
   }
 
+  stop(): void {
+    this.shutdown.abort();
+  }
+
   async reply(message: QQInboundMessage, text: string): Promise<void> {
     const reply = this.createReply(message);
     await reply.write(text);
@@ -80,7 +94,7 @@ export class QQSender {
 
   async runStreamingDiagnostic(
     message: QQInboundMessage,
-    pause: (milliseconds: number) => Promise<void> = sleep,
+    options: QQStreamingDiagnosticOptions = {},
   ): Promise<void> {
     if (message.chatType !== "direct") {
       throw new Error("QQ streaming diagnostics require a direct chat");
@@ -94,7 +108,24 @@ export class QQSender {
         streamResponses: true,
       },
       this.log,
+      options.isWakeup === true,
+      false,
     );
+    const pause = options.pause;
+    if (options.delayMinutes !== undefined) {
+      await reply.write(
+        `# QQ Streaming Diagnostic\n\nInitial frame accepted. Waiting ${options.delayMinutes} minute(s).`,
+      );
+      await reply.flush();
+      if (!(await this.pauseDiagnostic(options.delayMinutes * 60_000, pause))) {
+        return;
+      }
+      await reply.write(
+        `\n\nContinuation sent after ${options.delayMinutes} minute(s). is_wakeup=${options.isWakeup === true}.`,
+      );
+      await reply.finish();
+      return;
+    }
     const deltas = [
       "# QQ Streaming Diagnostic\n\n1. First generating frame accepted.",
       "\n\n2. Second generating frame accepted after one second.",
@@ -103,9 +134,29 @@ export class QQSender {
     for (const delta of deltas) {
       await reply.write(delta);
       await reply.flush();
-      await pause(STREAM_DIAGNOSTIC_INTERVAL_MS);
+      if (!(await this.pauseDiagnostic(STREAM_DIAGNOSTIC_INTERVAL_MS, pause))) {
+        return;
+      }
     }
     await reply.finish();
+  }
+
+  private async pauseDiagnostic(
+    milliseconds: number,
+    pause?: (milliseconds: number) => Promise<void>,
+  ): Promise<boolean> {
+    if (this.shutdown.signal.aborted) return false;
+    if (pause) {
+      await pause(milliseconds);
+      return !this.shutdown.signal.aborted;
+    }
+    try {
+      await sleep(milliseconds, this.shutdown.signal);
+      return true;
+    } catch (error) {
+      if (this.shutdown.signal.aborted) return false;
+      throw error;
+    }
   }
 }
 
@@ -123,6 +174,8 @@ class BufferedQQReply implements QQReplyStream {
   private streamTimer?: ReturnType<typeof setTimeout>;
   private streamError?: unknown;
   private streamLastAttemptAt?: number;
+  private streamStartedAt?: number;
+  private streamRecovered = false;
   private readonly streamTrace = nextStreamTrace++;
 
   constructor(
@@ -130,6 +183,8 @@ class BufferedQQReply implements QQReplyStream {
     private readonly message: QQInboundMessage,
     private readonly output: BotConfig["output"],
     private readonly log: (message: string) => void,
+    private readonly forceWakeup = false,
+    private readonly allowRecovery = true,
   ) {}
 
   write(text: string): Promise<void> {
@@ -316,7 +371,10 @@ class BufferedQQReply implements QQReplyStream {
   private renderStreamText(final = false): string {
     if (!final && this.effectiveMarkdownMode() === "plain") return "";
     const source = final ? this.buffer : streamSafeSource(this.buffer);
-    return this.render(source);
+    const rendered = this.render(source);
+    return this.streamRecovered
+      ? `${STREAM_RECOVERY_MARKER}${rendered}`
+      : rendered;
   }
 
   private assertStreamPrefix(desired: string): void {
@@ -333,10 +391,12 @@ class BufferedQQReply implements QQReplyStream {
     }
     const frameIndex = this.streamIndex;
     const attemptAt = Date.now();
-    const elapsedMs =
+    this.streamStartedAt ??= attemptAt;
+    const idleMs =
       this.streamLastAttemptAt === undefined
         ? "first"
         : String(attemptAt - this.streamLastAttemptAt);
+    const streamAgeMs = attemptAt - this.streamStartedAt;
     this.streamLastAttemptAt = attemptAt;
     const characters = countCharacters(text);
     const deltaCharacters = text.startsWith(this.streamLastText)
@@ -346,7 +406,7 @@ class BufferedQQReply implements QQReplyStream {
     const contentType =
       this.effectiveMarkdownMode() === "native" ? "markdown" : "text";
     this.log(
-      `QQ stream frame sending trace=${this.streamTrace} index=${frameIndex} state=${state} chars=${characters} deltaChars=${deltaCharacters} bytes=${bytes} elapsedMs=${elapsedMs} contentType=${contentType} streamStarted=${this.streamMessageId !== undefined}`,
+      `QQ stream frame sending trace=${this.streamTrace} index=${frameIndex} state=${state} chars=${characters} deltaChars=${deltaCharacters} bytes=${bytes} idleMs=${idleMs} streamAgeMs=${streamAgeMs} contentType=${contentType} streamStarted=${this.streamMessageId !== undefined} recovered=${this.streamRecovered} wakeup=${this.forceWakeup || this.streamRecovered}`,
     );
     let response: QQStreamMessageResponse;
     try {
@@ -359,11 +419,16 @@ class BufferedQQReply implements QQReplyStream {
         state,
         contentType,
         streamMessageId: this.streamMessageId,
+        isWakeup: this.forceWakeup || this.streamRecovered,
       });
     } catch (error) {
       this.log(
-        `QQ stream frame failed trace=${this.streamTrace} index=${frameIndex} state=${state} chars=${characters} deltaChars=${deltaCharacters} bytes=${bytes} elapsedMs=${elapsedMs} contentType=${contentType} streamStarted=${this.streamMessageId !== undefined} error=${streamErrorCategory(error)}${streamErrorDetails(error)}`,
+        `QQ stream frame failed trace=${this.streamTrace} index=${frameIndex} state=${state} chars=${characters} deltaChars=${deltaCharacters} bytes=${bytes} idleMs=${idleMs} streamAgeMs=${streamAgeMs} contentType=${contentType} streamStarted=${this.streamMessageId !== undefined} recovered=${this.streamRecovered} wakeup=${this.forceWakeup || this.streamRecovered} error=${streamErrorCategory(error)}${streamErrorDetails(error)}`,
       );
+      if (this.canRecoverExpiredStream(error)) {
+        await this.recoverExpiredStream(text, state);
+        return;
+      }
       throw error;
     }
     if (
@@ -378,6 +443,35 @@ class BufferedQQReply implements QQReplyStream {
     this.log(
       `QQ stream frame accepted trace=${this.streamTrace} index=${frameIndex} state=${state} chars=${countCharacters(text)} pending=${response.pendingCharacters ?? "unknown"}`,
     );
+  }
+
+  private canRecoverExpiredStream(error: unknown): boolean {
+    return (
+      this.allowRecovery &&
+      !this.streamRecovered &&
+      this.streamMessageId !== undefined &&
+      error instanceof QQApiError &&
+      String(error.code) === "40034020"
+    );
+  }
+
+  private async recoverExpiredStream(
+    text: string,
+    state: 1 | 10,
+  ): Promise<void> {
+    this.log(
+      `QQ stream recovery starting trace=${this.streamTrace} previousIndex=${this.streamIndex} strategy=new-wakeup-stream`,
+    );
+    this.streamRecovered = true;
+    this.streamMessageId = undefined;
+    this.streamIndex = 0;
+    this.streamSequence = this.allocateSequence();
+    this.streamLastText = "";
+    const recoveredText = `${STREAM_RECOVERY_MARKER}${text}`;
+    await this.sendStreamFrame(recoveredText, 1);
+    if (state === 10) {
+      await this.sendStreamFrame(recoveredText, 10);
+    }
   }
 
   private render(text: string): string {
@@ -594,8 +688,23 @@ function countCharacters(text: string): number {
   return Array.from(text).length;
 }
 
-function sleep(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+function sleep(milliseconds: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    timer.unref();
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function streamErrorCategory(error: unknown): string {

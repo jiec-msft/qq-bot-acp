@@ -14,6 +14,7 @@ export class BotRuntime {
   private readonly sessions: SessionManager;
   private readonly gateway: QQGateway;
   private readonly controller: BotController;
+  private readonly sender: QQSender;
 
   private constructor(
     config: BotConfig,
@@ -30,6 +31,7 @@ export class BotRuntime {
     );
     let controller!: BotController;
     const sender = new QQSender(api, () => controller.getConfig(), log);
+    this.sender = sender;
     controller = new BotController(config, store, this.sessions, sender, log);
     this.controller = controller;
     this.gateway = new QQGateway(
@@ -75,6 +77,7 @@ export class BotRuntime {
   }
 
   async stop(): Promise<void> {
+    this.sender.stop();
     await Promise.allSettled([this.gateway.stop(), this.sessions.stop()]);
     await this.artifacts.stop();
   }

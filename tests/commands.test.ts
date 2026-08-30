@@ -32,6 +32,16 @@ test("session configuration aliases remain conversation scoped", () => {
 test("streaming diagnostic command is recognized exactly", () => {
   assert.deepEqual(parseControlCommand("/test-streaming"), {
     kind: "test-streaming",
+    wakeup: false,
   });
-  assert.equal(parseControlCommand("/test-streaming now"), null);
+  assert.deepEqual(parseControlCommand("/test-streaming 10 wakeup"), {
+    kind: "test-streaming",
+    delayMinutes: 10,
+    wakeup: true,
+  });
+  assert.deepEqual(parseControlCommand("/test-streaming now"), {
+    kind: "test-streaming",
+    wakeup: false,
+    error: "Usage: /test-streaming [1|3|5|10] [wakeup]",
+  });
 });

@@ -243,15 +243,31 @@ Other bridge commands:
 /acp-new
 /id
 /test-streaming
+/test-streaming 1
+/test-streaming 3
+/test-streaming 5
+/test-streaming 10
+/test-streaming 10 wakeup
 ```
 
 An administrator can send `/test-streaming` in a direct chat to test QQ's
 official streaming transport without starting an ACP turn. The diagnostic
 forces three generating frames one second apart, then sends the final
-`input_state: 10` frame. Service logs record only the per-turn trace, frame
-index/state, cumulative and delta character counts, UTF-8 byte count, update
-interval, content type, stream state, QQ error metadata, and QQ-reported
-pending character count. Message content and full message IDs are not logged.
+`input_state: 10` frame. Add a supported minute value to test one continuation
+after a controlled 1, 3, 5, or 10 minute idle period. Add `wakeup` to set QQ's
+`is_wakeup=true` flag for an A/B comparison.
+
+When an established stream fails with QQ code `40034020`, the bridge makes one
+recovery attempt using a new stream, a new passive-reply sequence, and
+`is_wakeup=true`. The replacement stream is visibly labelled and includes the
+complete answer because QQ may have already displayed part of the expired
+stream. Other errors and a failed recovery still surface normally; recovery
+never loops.
+
+Service logs record only the per-turn trace, frame index/state, cumulative and
+delta character counts, UTF-8 byte count, idle time, total stream age, content
+type, stream state, recovery state, QQ error metadata, and QQ-reported pending
+character count. Message content and full message IDs are not logged.
 Logs are also appended to daily files under `~\.qq-bot-acp\logs\` or the
 selected instance directory. When QQ returns an `X-Tps-Trace-ID`, keep that
 value for platform support.

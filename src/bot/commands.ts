@@ -2,16 +2,44 @@ export type ControlCommand =
   | { kind: "id" }
   | { kind: "config"; key?: string; value?: string; operation: "show" | "get" | "set" | "status" }
   | { kind: "session-config"; key?: string; value?: string; operation: "show" | "set" | "reset" }
-  | { kind: "test-streaming" }
+  | {
+      kind: "test-streaming";
+      delayMinutes?: 1 | 3 | 5 | 10;
+      wakeup: boolean;
+      error?: string;
+    }
   | { kind: "cancel" }
   | { kind: "new" };
 
 export function parseControlCommand(text: string): ControlCommand | null {
   const trimmed = text.trim();
   if (trimmed === "/id") return { kind: "id" };
-  if (trimmed === "/test-streaming") return { kind: "test-streaming" };
   if (trimmed === "/acp-cancel") return { kind: "cancel" };
   if (trimmed === "/acp-new") return { kind: "new" };
+
+  const streaming = matchCommand(trimmed, ["/test-streaming"]);
+  if (streaming !== null) {
+    if (!streaming) return { kind: "test-streaming", wakeup: false };
+    const args = splitArguments(streaming).map(unquote);
+    const delay = Number(args[0]);
+    const wakeup = args[1] === "wakeup";
+    if (
+      ![1, 3, 5, 10].includes(delay) ||
+      args.length > 2 ||
+      (args.length === 2 && !wakeup)
+    ) {
+      return {
+        kind: "test-streaming",
+        wakeup: false,
+        error: "Usage: /test-streaming [1|3|5|10] [wakeup]",
+      };
+    }
+    return {
+      kind: "test-streaming",
+      delayMinutes: delay as 1 | 3 | 5 | 10,
+      wakeup,
+    };
+  }
 
   const config = matchCommand(trimmed, ["/config", "/c"]);
   if (config !== null) {
@@ -54,4 +82,15 @@ function matchCommand(text: string, names: string[]): string | null {
 
 function splitArguments(value: string): string[] {
   return value.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [];
+}
+
+function unquote(value: string): string {
+  if (
+    value.length >= 2 &&
+    ((value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'")))
+  ) {
+    return value.slice(1, -1);
+  }
+  return value;
 }

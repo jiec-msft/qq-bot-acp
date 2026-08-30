@@ -47,6 +47,7 @@ export interface QQSendStreamInput {
   state: 1 | 10;
   contentType: "text" | "markdown";
   streamMessageId?: string;
+  isWakeup?: boolean;
 }
 
 export interface QQStreamMessageResponse {
@@ -270,6 +271,7 @@ export function buildStreamMessageBody(
       ? { stream_msg_id: input.streamMessageId }
       : {}),
     msg_seq: input.sequence,
+    ...(input.isWakeup ? { is_wakeup: true } : {}),
   };
 }
 

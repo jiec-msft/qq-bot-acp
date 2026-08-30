@@ -32,6 +32,60 @@ test("QQ replies split at natural boundaries", () => {
   assert.deepEqual(splitText("😀x", 1), ["😀", "x"]);
 });
 
+test("delayed streaming diagnostic can compare wakeup behavior", async () => {
+  const { sender, streams } = senderFixture();
+  const pauses: number[] = [];
+
+  await sender.runStreamingDiagnostic(inboundMessage(), {
+    delayMinutes: 10,
+    isWakeup: true,
+    pause: async (milliseconds) => {
+      pauses.push(milliseconds);
+    },
+  });
+
+  assert.deepEqual(pauses, [600_000]);
+  assert.deepEqual(streams.map(({ index }) => index), [0, 1]);
+  assert.deepEqual(streams.map(({ state }) => state), [1, 10]);
+  assert.ok(streams.every(({ isWakeup }) => isWakeup === true));
+});
+
+test("stopping the sender cancels a delayed streaming diagnostic", async () => {
+  const { sender, streams } = senderFixture();
+  const diagnostic = sender.runStreamingDiagnostic(inboundMessage(), {
+    delayMinutes: 10,
+  });
+
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  sender.stop();
+  await diagnostic;
+
+  assert.equal(streams.length, 1);
+  assert.equal(streams[0]!.state, 1);
+});
+
+test("delayed diagnostics report expiry without automatic recovery", async () => {
+  const { sender, streams } = senderFixture({}, async (input) => {
+    if (input.index === 1) {
+      throw new QQApiError("stream send", 400, 40034020, "trace-test");
+    }
+    return { id: "diagnostic-stream" };
+  });
+
+  await assert.rejects(
+    sender.runStreamingDiagnostic(inboundMessage(), {
+      delayMinutes: 1,
+      pause: async () => {},
+    }),
+    /code 40034020/,
+  );
+
+  assert.deepEqual(streams.map(({ sequence, index }) => ({ sequence, index })), [
+    { sequence: 1, index: 0 },
+    { sequence: 1, index: 1 },
+  ]);
+});
+
 test("channel-compatible plain text avoids decorative Markdown simulation", () => {
   const markdown = [
     "# Result",
@@ -250,8 +304,10 @@ test("streaming diagnostic bypasses ACP and emits visible timed frames", async (
 
   await sender.runStreamingDiagnostic(
     inboundMessage(),
-    async (milliseconds) => {
-      pauses.push(milliseconds);
+    {
+      pause: async (milliseconds) => {
+        pauses.push(milliseconds);
+      },
     },
   );
 
@@ -276,7 +332,9 @@ test("streaming diagnostic bypasses ACP and emits visible timed frames", async (
   assert.ok(logs.every((entry) => !entry.includes(streams[0]!.text)));
 
   await assert.rejects(
-    sender.runStreamingDiagnostic(inboundMessage("group"), async () => {}),
+    sender.runStreamingDiagnostic(inboundMessage("group"), {
+      pause: async () => {},
+    }),
     /require a direct chat/,
   );
 });
@@ -287,7 +345,9 @@ test("remain_msg_len is pending telemetry and never stops a QQ stream", async ()
     pendingCharacters: [0, 17, 4, 0][input.index],
   }));
 
-  await sender.runStreamingDiagnostic(inboundMessage(), async () => {});
+  await sender.runStreamingDiagnostic(inboundMessage(), {
+    pause: async () => {},
+  });
 
   assert.deepEqual(streams.map(({ index }) => index), [0, 1, 2, 3]);
   assert.deepEqual(streams.map(({ state }) => state), [1, 1, 1, 10]);
@@ -515,6 +575,7 @@ test("QQ stream request bodies and responses follow the official contract", () =
       index: 1,
       state: 10,
       streamMessageId: "stream-1",
+      isWakeup: true,
     }),
     {
       input_mode: "replace",
@@ -525,6 +586,7 @@ test("QQ stream request bodies and responses follow the official contract", () =
       msg_id: "inbound",
       stream_msg_id: "stream-1",
       msg_seq: 2,
+      is_wakeup: true,
     },
   );
   assert.deepEqual(
@@ -772,9 +834,59 @@ test("an explicit QQ length rejection surfaces without local truncation", async 
   assert.match(logs.at(-1)!, /error=http-400$/);
 });
 
+test("expired stream failures restart once with a wakeup stream", async () => {
+  let expired = false;
+  const { sender, streams, logs } = senderFixture({}, async (input) => {
+    if (input.sequence === 1 && input.index === 1 && !expired) {
+      expired = true;
+      throw new QQApiError(
+        "stream send",
+        400,
+        40034020,
+        "trace-123",
+      );
+    }
+    return {
+      id: `stream-${input.sequence}`,
+      pendingCharacters: 0,
+    };
+  });
+  const reply = sender.createReply(inboundMessage());
+
+  await reply.write("start");
+  await waitForStreamUpdate();
+  await reply.write("追加");
+  await waitForStreamUpdate();
+  await reply.finish();
+
+  assert.deepEqual(
+    streams.map(({ sequence, index, state, isWakeup }) => ({
+      sequence,
+      index,
+      state,
+      isWakeup,
+    })),
+    [
+      { sequence: 1, index: 0, state: 1, isWakeup: false },
+      { sequence: 1, index: 1, state: 1, isWakeup: false },
+      { sequence: 2, index: 0, state: 1, isWakeup: true },
+      { sequence: 2, index: 1, state: 10, isWakeup: true },
+    ],
+  );
+  assert.match(
+    streams[2]!.text,
+    /^QQ stream resumed after an idle timeout[\s\S]*start追加$/,
+  );
+  assert.ok(
+    logs.some((entry) =>
+      entry.includes("strategy=new-wakeup-stream"),
+    ),
+  );
+});
+
 test("stream failure logs distinguish size, timing, and QQ metadata", async () => {
   const { sender, logs } = senderFixture({}, async (input) => {
-    if (input.index === 1) {
+    if (input.index === 1 || input.sequence === 2) {
       throw new QQApiError(
         "stream send",
         400,
@@ -795,9 +907,15 @@ test("stream failure logs distinguish size, timing, and QQ metadata", async () =
   await waitForStreamUpdate();
 
   await assert.rejects(reply.finish(), /code 40034020/);
-  const failure = logs.at(-1)!;
+  const failure = logs.find((entry) =>
+    entry.includes("frame failed") &&
+    entry.includes("index=1 state=1 chars=7"),
+  )!;
   assert.match(failure, /index=1 state=1 chars=7 deltaChars=2 bytes=11/);
-  assert.match(failure, /elapsedMs=\d+ contentType=markdown streamStarted=true/);
+  assert.match(
+    failure,
+    /idleMs=\d+ streamAgeMs=\d+ contentType=markdown streamStarted=true/,
+  );
   assert.match(failure, /error=http-400 qqCode=40034020/);
   assert.match(failure, /qqTrace=trace-123/);
   assert.doesNotMatch(failure, /start追加|content rejected/);
