@@ -165,12 +165,11 @@ export class QQGateway {
       const ready = data as { session_id?: string };
       this.state.sessionId = ready.session_id;
       await this.saveState();
-      this.reconnectAttempt = 0;
-      if (!this.readySettled) {
-        this.readySettled = true;
-        this.resolveReady();
-      }
-      this.log("QQ gateway ready");
+      this.markReady("new");
+      return;
+    }
+    if (type === "RESUMED") {
+      this.markReady("resumed");
       return;
     }
     if (!type || typeof data !== "object" || data === null) return;
@@ -197,6 +196,15 @@ export class QQGateway {
 
   private currentTokenPlaceholder(): string {
     return "__QQ_ACCESS_TOKEN__";
+  }
+
+  private markReady(source: "new" | "resumed"): void {
+    this.reconnectAttempt = 0;
+    if (!this.readySettled) {
+      this.readySettled = true;
+      this.resolveReady();
+    }
+    this.log(`QQ gateway ready (${source})`);
   }
 
   private async scheduleReconnect(): Promise<void> {
