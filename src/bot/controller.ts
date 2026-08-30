@@ -55,8 +55,13 @@ export class BotController {
           message,
           "The /test-streaming command is restricted to administrators in private chat.",
         );
+      } else if (command.error) {
+        await this.sender.reply(message, command.error);
       } else {
-        await this.sender.runStreamingDiagnostic(message);
+        await this.sender.runStreamingDiagnostic(message, {
+          delayMinutes: command.delayMinutes,
+          isWakeup: command.wakeup,
+        });
       }
       return;
     }
