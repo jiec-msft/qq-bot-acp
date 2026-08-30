@@ -45,3 +45,36 @@ test("streaming diagnostic command is recognized exactly", () => {
     error: "Usage: /test-streaming [1|3|5|10] [wakeup]",
   });
 });
+
+test("simple panel commands map to safe control actions", () => {
+  assert.deepEqual(parseControlCommand("Help"), { kind: "help" });
+  assert.deepEqual(parseControlCommand("New Chat"), { kind: "new" });
+  assert.deepEqual(parseControlCommand("Stop"), { kind: "cancel" });
+  assert.deepEqual(parseControlCommand("Status"), { kind: "status" });
+  assert.deepEqual(parseControlCommand("Normal"), {
+    kind: "mode",
+    mode: "normal",
+  });
+  assert.deepEqual(parseControlCommand("Deep"), {
+    kind: "mode",
+    mode: "deep",
+  });
+  assert.deepEqual(parseControlCommand("Learn improve equation rendering"), {
+    kind: "learn",
+    guidance: "improve equation rendering",
+  });
+  assert.deepEqual(parseControlCommand("Approve"), { kind: "approve" });
+  assert.deepEqual(parseControlCommand("Review"), { kind: "review" });
+  assert.deepEqual(parseControlCommand("Publish"), {
+    kind: "publish",
+    confirm: false,
+  });
+  assert.deepEqual(parseControlCommand("Publish Confirm"), {
+    kind: "publish",
+    confirm: true,
+  });
+  assert.deepEqual(parseControlCommand("Discard"), { kind: "discard" });
+  assert.deepEqual(parseControlCommand("/setup-controls"), {
+    kind: "setup-controls",
+  });
+});

@@ -57,10 +57,21 @@ lines.on("line", (line) => {
             id: "model",
             name: "Model",
             type: "select",
-            currentValue: "small",
+            currentValue: "gpt-5.6-sol",
             options: [
               { value: "small", name: "Small" },
-              { value: "large", name: "Large" }
+              { value: "large", name: "Large" },
+              { value: "gpt-5.6-sol", name: "GPT-5.6 Sol" }
+            ]
+          },
+          {
+            id: "reasoning_effort",
+            name: "Reasoning effort",
+            type: "select",
+            currentValue: "medium",
+            options: [
+              { value: "medium", name: "Medium" },
+              { value: "max", name: "Max" }
             ]
           }
         ],
@@ -78,10 +89,27 @@ lines.on("line", (line) => {
             id: "model",
             name: "Model",
             type: "select",
-            currentValue: request.params.value,
+            currentValue:
+              request.params.configId === "model"
+                ? request.params.value
+                : "gpt-5.6-sol",
             options: [
               { value: "small", name: "Small" },
-              { value: "large", name: "Large" }
+              { value: "large", name: "Large" },
+              { value: "gpt-5.6-sol", name: "GPT-5.6 Sol" }
+            ]
+          },
+          {
+            id: "reasoning_effort",
+            name: "Reasoning effort",
+            type: "select",
+            currentValue:
+              request.params.configId === "reasoning_effort"
+                ? request.params.value
+                : "medium",
+            options: [
+              { value: "medium", name: "Medium" },
+              { value: "max", name: "Max" }
             ]
           }
         ],

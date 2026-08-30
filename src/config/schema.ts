@@ -17,13 +17,20 @@ export const botConfigSchema = z.object({
   }),
   access: z.object({
     admins: z.array(nonEmptyString).default([]),
-    allowFrom: z.array(nonEmptyString).default(["*"]),
-    groupAllowFrom: z.array(nonEmptyString).default(["*"]),
+    allowFrom: z.array(nonEmptyString).default([]),
+    groupAllowFrom: z.array(nonEmptyString).default([]),
   }),
   sessions: z.object({
     idleTimeoutMs: z.number().int().nonnegative().default(86_400_000),
     maxConcurrent: z.number().int().positive().max(100).default(10),
     resume: z.enum(["off", "auto", "required"]).default("off"),
+    defaultOptions: z.record(
+      z.string(),
+      z.union([z.string(), z.boolean()]),
+    ).default({
+      model: "gpt-5.6-sol",
+      reasoning_effort: "medium",
+    }),
   }),
   output: z.object({
     textChunkLimit: z.number().int().min(100).max(4000).default(2000),
@@ -57,13 +64,17 @@ export function createInitialConfig(input: {
     },
     access: {
       admins: [],
-      allowFrom: ["*"],
-      groupAllowFrom: ["*"],
+      allowFrom: [],
+      groupAllowFrom: [],
     },
     sessions: {
       idleTimeoutMs: 86_400_000,
       maxConcurrent: 10,
       resume: "off",
+      defaultOptions: {
+        model: "gpt-5.6-sol",
+        reasoning_effort: "medium",
+      },
     },
     output: {
       textChunkLimit: 2000,

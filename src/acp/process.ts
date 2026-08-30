@@ -14,6 +14,8 @@ export interface AgentConnection {
   loaded: boolean;
 }
 
+export type SessionOptionValues = Record<string, string | boolean>;
+
 export async function startAgent(
   config: BotConfig["agent"],
   options?: {
@@ -23,7 +25,7 @@ export async function startAgent(
     log?: (message: string) => void;
   },
 ): Promise<AgentConnection> {
-  const client = new QQBotAcpClient();
+  const client = new QQBotAcpClient(config.cwd);
   const useShell =
     globalThis.process.platform === "win32" &&
     (path.extname(config.command) === "" || /\.(?:cmd|bat)$/i.test(config.command));
@@ -111,9 +113,83 @@ export async function startAgent(
 export async function smokeTestAgent(
   config: BotConfig["agent"],
   mcpServers: acp.McpServer[] = [],
+  sessionOptions: SessionOptionValues = {},
 ): Promise<void> {
   const agent = await startAgent(config, { mcpServers });
-  await stopAgentProcess(agent.process);
+  try {
+    await applySessionOptions(agent, sessionOptions, true);
+  } finally {
+    await stopAgentProcess(agent.process);
+  }
+}
+
+export async function applySessionOptions(
+  agent: AgentConnection,
+  values: SessionOptionValues,
+  strict: boolean,
+): Promise<void> {
+  for (const [configId, value] of Object.entries(values)) {
+    const option = agent.configOptions.find((entry) => entry.id === configId);
+    if (!option) {
+      if (!strict) continue;
+      const available = agent.configOptions.map((option) => option.id);
+      throw new Error(
+        available.length
+          ? `ACP agent does not advertise required session option "${configId}". Available: ${available.join(", ")}`
+          : `ACP agent does not advertise required session option "${configId}"`,
+      );
+    }
+    assertSessionOptionValue(option, value);
+    const response = await agent.connection.setSessionConfigOption(
+      typeof value === "boolean"
+        ? { sessionId: agent.sessionId, configId, type: "boolean", value }
+        : { sessionId: agent.sessionId, configId, value },
+    );
+    agent.configOptions = response.configOptions;
+  }
+}
+
+export function validateSessionOptionValues(
+  options: acp.SessionConfigOption[],
+  values: SessionOptionValues,
+  strict: boolean,
+): void {
+  for (const [configId, value] of Object.entries(values)) {
+    const option = options.find((entry) => entry.id === configId);
+    if (!option) {
+      if (!strict) continue;
+      const available = options.map((entry) => entry.id);
+      throw new Error(
+        available.length
+          ? `ACP agent does not advertise required session option "${configId}". Available: ${available.join(", ")}`
+          : `ACP agent does not advertise required session option "${configId}"`,
+      );
+    }
+    assertSessionOptionValue(option, value);
+  }
+}
+
+function assertSessionOptionValue(
+  option: acp.SessionConfigOption,
+  value: string | boolean,
+): void {
+  if (option.type === "boolean") {
+    if (typeof value !== "boolean") {
+      throw new Error(`ACP session option "${option.id}" requires a boolean`);
+    }
+    return;
+  }
+  if (typeof value !== "string") {
+    throw new Error(`ACP session option "${option.id}" requires a string`);
+  }
+  const choices = option.options.flatMap((entry) =>
+    "value" in entry ? [entry.value] : entry.options.map((choice) => choice.value),
+  );
+  if (!choices.includes(value)) {
+    throw new Error(
+      `ACP session option "${option.id}" does not support value "${value}". Available: ${choices.join(", ")}`,
+    );
+  }
 }
 
 export async function stopAgentProcess(process: ChildProcess, timeoutMs = 5_000): Promise<void> {

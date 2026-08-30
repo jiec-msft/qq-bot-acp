@@ -55,6 +55,27 @@ export interface QQStreamMessageResponse {
   pendingCharacters?: number;
 }
 
+export type QQPanelScope = "c2c" | "group" | "channel" | "dm";
+
+export interface QQPanelItem {
+  name: string;
+  desc: string;
+  type: "command" | "link";
+  only_admin?: boolean;
+  link?: string;
+}
+
+export interface QQPanelRecord {
+  panel_id: string;
+  scope: QQPanelScope;
+  target_type: "all" | "specific";
+  panel: {
+    items?: QQPanelItem[];
+    remark?: string;
+    version?: number;
+  };
+}
+
 export class QQApiError extends Error {
   constructor(
     operation: string,
@@ -187,6 +208,82 @@ export class QQApi {
       throw qqApiError("stream send", response, result);
     }
     return parseStreamMessageResponse(result);
+  }
+
+  async updateMenu(items: Record<string, unknown>[]): Promise<void> {
+    const response = await this.request("/v2/menu", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ menu: { items } }),
+    });
+    const result = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!response.ok) throw qqApiError("menu update", response, result);
+  }
+
+  async listPanels(
+    scope: QQPanelScope,
+    cursor = "",
+  ): Promise<{
+    records: QQPanelRecord[];
+    nextCursor: string;
+    isEnd: boolean;
+  }> {
+    const query = new URLSearchParams({ scope, limit: "50" });
+    if (cursor) query.set("cursor", cursor);
+    const response = await this.request(`/v2/panels?${query}`, {
+      method: "GET",
+    });
+    const result = (await response.json().catch(() => ({}))) as {
+      records?: QQPanelRecord[];
+      next_cursor?: string;
+      is_end?: boolean;
+    } & Record<string, unknown>;
+    if (!response.ok) throw qqApiError("panel list", response, result);
+    return {
+      records: Array.isArray(result.records) ? result.records : [],
+      nextCursor:
+        typeof result.next_cursor === "string" ? result.next_cursor : "",
+      isEnd: result.is_end === true || !result.next_cursor,
+    };
+  }
+
+  async createPanel(
+    scope: QQPanelScope,
+    panel: { items: QQPanelItem[]; remark: string },
+  ): Promise<string> {
+    const response = await this.request("/v2/panels", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        scope,
+        target_type: "all",
+        panel,
+      }),
+    });
+    const result = (await response.json().catch(() => ({}))) as {
+      panel_id?: string;
+    } & Record<string, unknown>;
+    if (!response.ok) throw qqApiError("panel create", response, result);
+    if (!result.panel_id) {
+      throw new Error("QQ panel create response did not include panel_id");
+    }
+    return result.panel_id;
+  }
+
+  async updatePanel(
+    panelId: string,
+    panel: { items: QQPanelItem[]; remark: string },
+  ): Promise<void> {
+    const response = await this.request(
+      `/v2/panels/${encodeURIComponent(panelId)}`,
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ panel }),
+      },
+    );
+    const result = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!response.ok) throw qqApiError("panel update", response, result);
   }
 
   private async request(endpoint: string, init: RequestInit, retry = true): Promise<Response> {
