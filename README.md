@@ -61,7 +61,7 @@ qq-bot-acp init \
   --app-id "YOUR_APP_ID" \
   --client-secret-file "$HOME/.qq-bot-acp/secrets/qq-app-secret.txt" \
   --agent "npx" \
-  --agent-arg "@github/copilot" \
+  --agent-arg "@github/copilot@1.0.82" \
   --agent-arg "--acp" \
   --cwd "/path/to/agent-workspace"
 ```
@@ -257,7 +257,7 @@ content and full message IDs are not logged.
 GitHub Copilot:
 
 ```powershell
---agent "npx" --agent-arg "@github/copilot" --agent-arg "--acp"
+--agent "npx" --agent-arg "@github/copilot@1.0.82" --agent-arg "--acp"
 ```
 
 Claude Code ACP:
