@@ -115,10 +115,15 @@ chat:
 /config agent.command "my-agent"
 /c agent.args ["acp","--profile","work"]
 /c sessions.idleTimeoutMs 3600000
+/c sessions.defaultOptions.model "gpt-5.6-sol"
+/c sessions.defaultOptions.reasoning_effort "medium"
 /config status
 ```
 
 Values use JSON when appropriate; an unquoted scalar is treated as text.
+Global configuration updates are serialized. `agent.cwd` cannot be changed
+while the bot is running; edit the configuration and restart for a workspace
+change.
 Configuration writes are atomic. After the QQ gateway authenticates, reaches
 ready state, and the ACP agent passes `initialize` plus `session/new`, the
 configuration is copied to `config.proven.json`. If the next launch fails, the
@@ -222,7 +227,18 @@ agent must advertise HTTP MCP support.
 
 ## ACP session configuration
 
-Session options belong to the current QQ conversation and configured agent:
+New sessions require the configured ACP agent to advertise `model` and
+`reasoning_effort`. The defaults are GPT-5.6 Sol with medium reasoning:
+
+```text
+sessions.defaultOptions.model = "gpt-5.6-sol"
+sessions.defaultOptions.reasoning_effort = "medium"
+```
+
+`Normal` selects medium reasoning and `Deep` selects max reasoning for the
+current QQ conversation. Either command starts a new ACP session on the next
+message so the selected values and latest workspace instructions are loaded.
+Advanced session options remain available:
 
 ```text
 /session-config
@@ -234,13 +250,24 @@ Session options belong to the current QQ conversation and configured agent:
 The keys come from the active agent's advertised ACP
 `SessionConfigOption[]`. Options are validated through
 `session/set_config_option`, persisted, and reapplied when that conversation's
-ACP session is recreated. Send a normal message before setting an option.
+ACP session is recreated. Send a normal message before setting an advanced option.
 
 Other bridge commands:
 
 ```text
-/acp-cancel
-/acp-new
+Help
+New Chat
+Stop
+Status
+Normal
+Deep
+Learn
+Approve
+Review
+Publish
+Publish Confirm
+Discard
+/setup-controls
 /id
 /test-streaming
 /test-streaming 1
@@ -249,6 +276,32 @@ Other bridge commands:
 /test-streaming 10
 /test-streaming 10 wakeup
 ```
+
+Run `/setup-controls` once from an administrator private chat to install or
+update the global C2C menu and the C2C/group command panels. Labels use simple
+English; the bot's workflow responses and the teaching agent can use Chinese.
+
+QQ groups and private chats keep independent ACP sessions and per-conversation
+FIFO queues. Different conversations can run concurrently in the same
+`agent.cwd`. `Status` makes this visible. The shared workspace must therefore
+contain agent instructions that require Git-status checks, scoped edits, and
+coordination before touching overlapping files.
+
+Images, PPTX, Word, PDF, and other non-executable attachments are downloaded
+over HTTPS into `.tmp/qq-bot-acp/<conversation>/`, limited to 25 MB, and removed
+after seven days or by `Discard`. The bot adds this directory to Git's local
+exclude file when needed and rejects symlinked staging directories. The path is
+passed to the agent; attachment URLs and message content are not persisted in
+service logs.
+
+`Learn` runs with restricted permissions and can write only its untracked
+learning proposal. `Review` binds approval to that proposal's SHA-256 digest.
+`Approve` consumes that authorization, serializes the short Git mutation phase,
+and creates a local commit without pushing. Other conversations remain
+concurrent. `Publish` shows every local commit; `Publish Confirm` rechecks the
+head, upstream commit, push URL, and clean worktree before pushing the reviewed
+SHA with Git hooks disabled. Temporary/generated paths in any pushed commit and
+individual files larger than 10 MB are rejected.
 
 An administrator can send `/test-streaming` in a direct chat to test QQ's
 official streaming transport without starting an ACP turn. The diagnostic
@@ -298,15 +351,17 @@ stdin/stdout.
 ## Access and session behavior
 
 - Direct, group `@`, and guild channel messages are supported.
-- `access.allowFrom` and `access.groupAllowFrom` default to `["*"]`.
+- `access.allowFrom` and `access.groupAllowFrom` default to `[]` (deny by
+  default). Add only trusted bot-scoped OpenIDs; use `"*"` only intentionally.
 - Global `/config` commands always require a direct-message administrator,
   regardless of those allowlists.
 - Each conversation has its own serialized queue, agent subprocess, and ACP
-  session.
-- Text and image prompts are forwarded to ACP. Other attachments are exposed
-  to the agent as source URLs.
+  session. Different conversations can execute concurrently.
+- Attachments are staged inside `agent.cwd`; executable/script attachments are
+  rejected.
 - Agent text is split to the configured QQ message limit before delivery.
-- ACP permission requests automatically select an allow option.
+- ACP file callbacks are contained inside `agent.cwd`, including symlink-aware
+  checks. Permission requests prefer one-time approval over permanent approval.
 
 ## Acknowledgements
 

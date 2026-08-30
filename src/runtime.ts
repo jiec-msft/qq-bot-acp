@@ -7,14 +7,18 @@ import { BotController } from "./bot/controller.js";
 import type { BotConfig } from "./config/schema.js";
 import { ConfigStore } from "./config/store.js";
 import { QQApi } from "./qq/api.js";
+import { QQControls } from "./qq/controls.js";
 import { QQGateway } from "./qq/gateway.js";
 import { QQSender } from "./qq/sender.js";
+import { AttachmentStager } from "./uploads/stager.js";
+import { WorkspaceRepository } from "./workspace/repository.js";
 
 export class BotRuntime {
   private readonly sessions: SessionManager;
   private readonly gateway: QQGateway;
   private readonly controller: BotController;
   private readonly sender: QQSender;
+  private readonly stager: AttachmentStager;
 
   private constructor(
     config: BotConfig,
@@ -32,7 +36,18 @@ export class BotRuntime {
     let controller!: BotController;
     const sender = new QQSender(api, () => controller.getConfig(), log);
     this.sender = sender;
-    controller = new BotController(config, store, this.sessions, sender, log);
+    const controls = new QQControls(api);
+    this.stager = new AttachmentStager(config.agent.cwd, log);
+    controller = new BotController(
+      config,
+      store,
+      this.sessions,
+      sender,
+      controls,
+      this.stager,
+      new WorkspaceRepository(config.agent.cwd),
+      log,
+    );
     this.controller = controller;
     this.gateway = new QQGateway(
       api,
@@ -55,7 +70,11 @@ export class BotRuntime {
     await artifacts.start();
     const testArtifacts = artifacts.createSession(config.agent.cwd);
     try {
-      await smokeTestAgent(config.agent, [testArtifacts.mcpServer]);
+      await smokeTestAgent(
+        config.agent,
+        [testArtifacts.mcpServer],
+        config.sessions.defaultOptions,
+      );
       return new BotRuntime(config, store, api, artifacts, log);
     } catch (error) {
       await artifacts.stop();
@@ -66,6 +85,7 @@ export class BotRuntime {
   }
 
   async start(): Promise<void> {
+    await this.stager.start();
     this.sessions.start();
     try {
       await this.gateway.start();

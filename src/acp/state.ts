@@ -64,6 +64,30 @@ export class SessionStateStore {
     await this.save();
   }
 
+  async setOptions(
+    key: string,
+    agent: BotConfig["agent"],
+    values: Record<string, string | boolean>,
+  ): Promise<void> {
+    await this.load();
+    const scope = scopeKey(key, agent);
+    this.state.options[scope] = {
+      ...(this.state.options[scope] ?? {}),
+      ...values,
+    };
+    await this.save();
+  }
+
+  async replaceOptions(
+    key: string,
+    agent: BotConfig["agent"],
+    values: Record<string, string | boolean>,
+  ): Promise<void> {
+    await this.load();
+    this.state.options[scopeKey(key, agent)] = { ...values };
+    await this.save();
+  }
+
   async clearOptions(key: string, agent: BotConfig["agent"]): Promise<void> {
     await this.load();
     delete this.state.options[scopeKey(key, agent)];

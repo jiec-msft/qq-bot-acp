@@ -1,5 +1,14 @@
 export type ControlCommand =
   | { kind: "id" }
+  | { kind: "help" }
+  | { kind: "status" }
+  | { kind: "mode"; mode: "normal" | "deep" }
+  | { kind: "learn"; guidance?: string }
+  | { kind: "approve" }
+  | { kind: "review" }
+  | { kind: "publish"; confirm: boolean; error?: string }
+  | { kind: "discard" }
+  | { kind: "setup-controls" }
   | { kind: "config"; key?: string; value?: string; operation: "show" | "get" | "set" | "status" }
   | { kind: "session-config"; key?: string; value?: string; operation: "show" | "set" | "reset" }
   | {
@@ -13,9 +22,49 @@ export type ControlCommand =
 
 export function parseControlCommand(text: string): ControlCommand | null {
   const trimmed = text.trim();
-  if (trimmed === "/id") return { kind: "id" };
-  if (trimmed === "/acp-cancel") return { kind: "cancel" };
-  if (trimmed === "/acp-new") return { kind: "new" };
+  const normalized = trimmed.toLowerCase();
+  if (normalized === "/id") return { kind: "id" };
+  if (["help", "/help"].includes(normalized)) return { kind: "help" };
+  if (["status", "/status"].includes(normalized)) return { kind: "status" };
+  if (["normal", "/normal"].includes(normalized)) {
+    return { kind: "mode", mode: "normal" };
+  }
+  if (["deep", "/deep"].includes(normalized)) {
+    return { kind: "mode", mode: "deep" };
+  }
+  if (["approve", "/approve"].includes(normalized)) return { kind: "approve" };
+  if (["review", "/review"].includes(normalized)) return { kind: "review" };
+  if (["discard", "/discard"].includes(normalized)) return { kind: "discard" };
+  if (["setup controls", "/setup-controls"].includes(normalized)) {
+    return { kind: "setup-controls" };
+  }
+  if (["stop", "/stop", "/acp-cancel"].includes(normalized)) {
+    return { kind: "cancel" };
+  }
+  if (["new chat", "/new", "/acp-new"].includes(normalized)) {
+    return { kind: "new" };
+  }
+
+  const learning = matchCommandInsensitive(trimmed, ["Learn", "/learn"]);
+  if (learning !== null) {
+    return {
+      kind: "learn",
+      guidance: learning || undefined,
+    };
+  }
+
+  const publishing = matchCommandInsensitive(trimmed, ["Publish", "/publish"]);
+  if (publishing !== null) {
+    if (!publishing) return { kind: "publish", confirm: false };
+    if (publishing.toLowerCase() === "confirm") {
+      return { kind: "publish", confirm: true };
+    }
+    return {
+      kind: "publish",
+      confirm: false,
+      error: "Usage: Publish or Publish Confirm",
+    };
+  }
 
   const streaming = matchCommand(trimmed, ["/test-streaming"]);
   if (streaming !== null) {
@@ -76,6 +125,18 @@ function matchCommand(text: string, names: string[]): string | null {
   for (const name of names) {
     if (text === name) return "";
     if (text.startsWith(`${name} `)) return text.slice(name.length).trim();
+  }
+  return null;
+}
+
+function matchCommandInsensitive(text: string, names: string[]): string | null {
+  const lower = text.toLowerCase();
+  for (const name of names) {
+    const normalized = name.toLowerCase();
+    if (lower === normalized) return "";
+    if (lower.startsWith(`${normalized} `)) {
+      return text.slice(name.length).trim();
+    }
   }
   return null;
 }

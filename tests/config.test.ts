@@ -32,6 +32,12 @@ test("configuration paths are independent of cwd and conversations", async () =>
 
 test("configuration values support JSON and validated dotted updates", async () => {
   const { config } = await fixture();
+  assert.deepEqual(config.access.allowFrom, []);
+  assert.deepEqual(config.access.groupAllowFrom, []);
+  assert.deepEqual(config.sessions.defaultOptions, {
+    model: "gpt-5.6-sol",
+    reasoning_effort: "medium",
+  });
   const updated = setConfigValue(config, "agent.args", parseConfigValue('["acp"]'));
   assert.deepEqual(getConfigValue(updated, "agent.args"), ["acp"]);
   assert.throws(() => setConfigValue(config, "sessions.maxConcurrent", 0));
@@ -43,6 +49,11 @@ test("legacy configurations receive output formatting defaults", async () => {
   assert.equal(config.output.markdownMode, "native");
   const legacy = {
     ...config,
+    sessions: {
+      idleTimeoutMs: config.sessions.idleTimeoutMs,
+      maxConcurrent: config.sessions.maxConcurrent,
+      resume: config.sessions.resume,
+    },
     output: {
       textChunkLimit: config.output.textChunkLimit,
       showThoughts: config.output.showThoughts,
@@ -51,6 +62,7 @@ test("legacy configurations receive output formatting defaults", async () => {
 
   const parsed = parseConfig(legacy);
   assert.deepEqual(parsed.output, config.output);
+  assert.deepEqual(parsed.sessions.defaultOptions, config.sessions.defaultOptions);
   assert.equal(parsed.output.markdownMode, "native");
 });
 
