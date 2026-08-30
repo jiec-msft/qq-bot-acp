@@ -7,6 +7,7 @@ import {
   buildStreamMessageBody,
   buildTextMessageBody,
   parseStreamMessageResponse,
+  QQApiError,
   QQApi,
   type QQSendMediaInput,
   type QQSendStreamInput,
@@ -593,6 +594,54 @@ test("QQ API posts stream frames to the direct stream endpoint", async () => {
   }
 });
 
+test("QQ API preserves privacy-safe stream error diagnostics", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    if (String(input).includes("/getAppAccessToken")) {
+      return new Response(JSON.stringify({
+        access_token: "token",
+        expires_in: 7200,
+      }), { status: 200 });
+    }
+    return new Response(JSON.stringify({
+      code: 40034020,
+      message: "stream content rejected\nby platform",
+      trace_id: "trace-from-body",
+    }), {
+      status: 400,
+      headers: { "x-tps-trace-id": "trace-from-header" },
+    });
+  };
+
+  try {
+    await assert.rejects(
+      () => new QQApi("app", "secret").sendStream({
+        targetId: "user",
+        text: "private response",
+        replyToId: "inbound",
+        sequence: 1,
+        index: 5,
+        state: 1,
+        contentType: "markdown",
+        streamMessageId: "stream-1",
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof QQApiError);
+        assert.equal(error.status, 400);
+        assert.equal(error.code, 40034020);
+        assert.equal(error.traceId, "trace-from-header");
+        assert.doesNotMatch(
+          error.message,
+          /private response|stream content rejected/,
+        );
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("interleaved turns retain their own inbound and stream message IDs", async () => {
   const { sender, streams } = senderFixture();
   const first = sender.createReply(inboundMessage("direct", "inbound-a", "user-a"));
@@ -721,6 +770,63 @@ test("an explicit QQ length rejection surfaces without local truncation", async 
   assert.deepEqual(streams.map(({ index }) => index), [0, 1]);
   assert.match(streams[1]!.text, /^startx{200}$/);
   assert.match(logs.at(-1)!, /error=http-400$/);
+});
+
+test("stream failure logs distinguish size, timing, and QQ metadata", async () => {
+  const { sender, logs } = senderFixture({}, async (input) => {
+    if (input.index === 1) {
+      throw new QQApiError(
+        "stream send",
+        400,
+        40034020,
+        "trace-123",
+      );
+    }
+    return {
+      id: `stream-${input.replyToId}`,
+      pendingCharacters: 0,
+    };
+  });
+  const reply = sender.createReply(inboundMessage());
+
+  await reply.write("start");
+  await waitForStreamUpdate();
+  await reply.write("追加");
+  await waitForStreamUpdate();
+
+  await assert.rejects(reply.finish(), /code 40034020/);
+  const failure = logs.at(-1)!;
+  assert.match(failure, /index=1 state=1 chars=7 deltaChars=2 bytes=11/);
+  assert.match(failure, /elapsedMs=\d+ contentType=markdown streamStarted=true/);
+  assert.match(failure, /error=http-400 qqCode=40034020/);
+  assert.match(failure, /qqTrace=trace-123/);
+  assert.doesNotMatch(failure, /start追加|content rejected/);
+});
+
+test("stream ID mismatch errors do not expose either QQ message ID", async () => {
+  const { sender } = senderFixture({}, async (input) => ({
+    id: input.index === 0 ? "sensitive-stream-a" : "sensitive-stream-b",
+    pendingCharacters: 0,
+  }));
+  const reply = sender.createReply(inboundMessage());
+
+  await reply.write("start");
+  await waitForStreamUpdate();
+  await reply.write(" more");
+  await waitForStreamUpdate();
+
+  await assert.rejects(
+    reply.finish(),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /changed the stream message ID/);
+      assert.doesNotMatch(
+        error.message,
+        /sensitive-stream-a|sensitive-stream-b/,
+      );
+      return true;
+    },
+  );
 });
 
 test("plain compatibility rendering waits for a prefix-safe final frame", async () => {

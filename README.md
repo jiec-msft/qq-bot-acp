@@ -249,8 +249,12 @@ An administrator can send `/test-streaming` in a direct chat to test QQ's
 official streaming transport without starting an ACP turn. The diagnostic
 forces three generating frames one second apart, then sends the final
 `input_state: 10` frame. Service logs record only the per-turn trace, frame
-index/state, character count, and QQ-reported pending character count; message
-content and full message IDs are not logged.
+index/state, cumulative and delta character counts, UTF-8 byte count, update
+interval, content type, stream state, QQ error metadata, and QQ-reported
+pending character count. Message content and full message IDs are not logged.
+Logs are also appended to daily files under `~\.qq-bot-acp\logs\` or the
+selected instance directory. When QQ returns an `X-Tps-Trace-ID`, keep that
+value for platform support.
 
 ## Agent examples
 

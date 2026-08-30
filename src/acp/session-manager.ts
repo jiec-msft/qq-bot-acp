@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import type * as acp from "@agentclientprotocol/sdk";
 import {
   ArtifactBroker,
@@ -194,7 +195,8 @@ export class SessionManager {
         persistedSessionId,
         resume: this.config.sessions.resume,
         mcpServers: [artifacts.mcpServer],
-        log: (message) => this.log(`[${key}] ${message}`),
+        log: (message) =>
+          this.log(`[conversation=${conversationLogId(key)}] ${message}`),
       });
     } catch (error) {
       artifacts.dispose();
@@ -267,4 +269,8 @@ export class SessionManager {
     session.artifacts.dispose();
     await stopAgentProcess(session.agent.process);
   }
+}
+
+export function conversationLogId(key: string): string {
+  return crypto.createHash("sha256").update(key).digest("hex").slice(0, 12);
 }

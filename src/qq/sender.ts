@@ -11,6 +11,7 @@ import type {
   QQSendTextInput,
   QQUploadMediaInput,
 } from "./api.js";
+import { QQApiError } from "./api.js";
 import {
   findStreamingSplit,
   renderNativeMarkdownForQQ,
@@ -121,6 +122,7 @@ class BufferedQQReply implements QQReplyStream {
   private streamLastText = "";
   private streamTimer?: ReturnType<typeof setTimeout>;
   private streamError?: unknown;
+  private streamLastAttemptAt?: number;
   private readonly streamTrace = nextStreamTrace++;
 
   constructor(
@@ -330,8 +332,21 @@ class BufferedQQReply implements QQReplyStream {
       this.streamSequence = this.allocateSequence();
     }
     const frameIndex = this.streamIndex;
+    const attemptAt = Date.now();
+    const elapsedMs =
+      this.streamLastAttemptAt === undefined
+        ? "first"
+        : String(attemptAt - this.streamLastAttemptAt);
+    this.streamLastAttemptAt = attemptAt;
+    const characters = countCharacters(text);
+    const deltaCharacters = text.startsWith(this.streamLastText)
+      ? countCharacters(text.slice(this.streamLastText.length))
+      : characters;
+    const bytes = Buffer.byteLength(text, "utf8");
+    const contentType =
+      this.effectiveMarkdownMode() === "native" ? "markdown" : "text";
     this.log(
-      `QQ stream frame sending trace=${this.streamTrace} index=${frameIndex} state=${state} chars=${countCharacters(text)}`,
+      `QQ stream frame sending trace=${this.streamTrace} index=${frameIndex} state=${state} chars=${characters} deltaChars=${deltaCharacters} bytes=${bytes} elapsedMs=${elapsedMs} contentType=${contentType} streamStarted=${this.streamMessageId !== undefined}`,
     );
     let response: QQStreamMessageResponse;
     try {
@@ -342,13 +357,12 @@ class BufferedQQReply implements QQReplyStream {
         sequence: this.streamSequence,
         index: frameIndex,
         state,
-        contentType:
-          this.effectiveMarkdownMode() === "native" ? "markdown" : "text",
+        contentType,
         streamMessageId: this.streamMessageId,
       });
     } catch (error) {
       this.log(
-        `QQ stream frame failed trace=${this.streamTrace} index=${frameIndex} state=${state} error=${streamErrorCategory(error)}`,
+        `QQ stream frame failed trace=${this.streamTrace} index=${frameIndex} state=${state} chars=${characters} deltaChars=${deltaCharacters} bytes=${bytes} elapsedMs=${elapsedMs} contentType=${contentType} streamStarted=${this.streamMessageId !== undefined} error=${streamErrorCategory(error)}${streamErrorDetails(error)}`,
       );
       throw error;
     }
@@ -356,9 +370,7 @@ class BufferedQQReply implements QQReplyStream {
       this.streamMessageId !== undefined &&
       response.id !== this.streamMessageId
     ) {
-      throw new Error(
-        `QQ stream message ID changed from ${this.streamMessageId} to ${response.id}`,
-      );
+      throw new Error("QQ stream response changed the stream message ID");
     }
     this.streamMessageId ??= response.id;
     this.streamIndex++;
@@ -597,4 +609,15 @@ function streamErrorCategory(error: unknown): string {
     return "invalid-response-length";
   }
   return "request-error";
+}
+
+function streamErrorDetails(error: unknown): string {
+  if (!(error instanceof QQApiError)) return "";
+  return [
+    error.code === undefined ? undefined : `qqCode=${error.code}`,
+    error.traceId ? `qqTrace=${error.traceId}` : undefined,
+  ]
+    .filter(Boolean)
+    .map((entry) => ` ${entry}`)
+    .join("");
 }
