@@ -1,5 +1,7 @@
 # QQ Bot ACP
 
+[English](README.md) | [简体中文](README.zh.md)
+
 Connect an official QQ Bot to any agent that implements the
 [Agent Client Protocol (ACP)](https://agentclientprotocol.com/) over stdio.
 
@@ -14,6 +16,9 @@ automatically accepts ACP tool permission requests.
 - An ACP-compatible agent command
 
 ## Create a QQ bot
+
+For a Chinese end-to-end setup guide with production pitfalls, see
+[QQ Bot integration and deployment guide](docs/qq-bot-setup.zh.md).
 
 Use the official QQ Open Platform:
 
