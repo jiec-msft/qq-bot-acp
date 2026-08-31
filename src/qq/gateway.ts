@@ -174,6 +174,11 @@ export class QQGateway {
     }
     if (!type || typeof data !== "object" || data === null) return;
     const message = normalizeInbound(type, data as Record<string, unknown>, this.api.appId);
+    if (isMessageDispatch(type)) {
+      this.log(
+        `QQ gateway message dispatch type=${type} accepted=${message !== null}`,
+      );
+    }
     if (!message) return;
     void this.onMessage(message).catch((error) => {
       this.log(`Inbound message failed: ${String(error)}`);
@@ -236,7 +241,7 @@ export class QQGateway {
   }
 }
 
-function normalizeInbound(
+export function normalizeInbound(
   type: string,
   event: Record<string, unknown>,
   accountId: string,
@@ -262,7 +267,19 @@ function normalizeInbound(
       targetId: senderId,
     };
   }
-  if (type === "GROUP_AT_MESSAGE_CREATE") {
+  if (
+    type === "GROUP_AT_MESSAGE_CREATE" ||
+    type === "GROUP_MESSAGE_CREATE"
+  ) {
+    if (
+      type === "GROUP_MESSAGE_CREATE" &&
+      (
+        author.bot === true ||
+        !normalizeMentions(event.mentions).some((mention) => mention.bot === true)
+      )
+    ) {
+      return null;
+    }
     const senderId = String(author.member_openid ?? "");
     const targetId = String(event.group_openid ?? "");
     if (!senderId || !targetId) return null;
@@ -274,6 +291,7 @@ function normalizeInbound(
       targetId,
     };
   }
+
   if (type === "AT_MESSAGE_CREATE" || type === "DIRECT_MESSAGE_CREATE") {
     const senderId = String(author.id ?? "");
     const targetId = String(event.channel_id ?? "");
@@ -288,6 +306,20 @@ function normalizeInbound(
     };
   }
   return null;
+}
+
+function normalizeMentions(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value) ? value.map(asRecord) : [];
+}
+
+function isMessageDispatch(type: string): boolean {
+  return [
+    "C2C_MESSAGE_CREATE",
+    "GROUP_AT_MESSAGE_CREATE",
+    "GROUP_MESSAGE_CREATE",
+    "AT_MESSAGE_CREATE",
+    "DIRECT_MESSAGE_CREATE",
+  ].includes(type);
 }
 
 function normalizeAttachments(value: unknown): QQAttachment[] {
