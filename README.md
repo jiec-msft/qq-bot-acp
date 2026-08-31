@@ -33,6 +33,37 @@ Use the official QQ Open Platform:
 7. Generate or reveal its **AppSecret**, then save it immediately. QQ may not
    display the secret again.
 
+## Enable each QQ group in the mobile client
+
+QQ exposes two important robot switches only in the mobile client, and they
+must be enabled separately for every group:
+
+1. Open the target QQ group on a phone.
+2. Open the robot list or tap the robot avatar.
+3. Open the robot's settings.
+4. Enable robot push messages. This allows results to be sent after the
+   five-minute passive-reply window expires.
+5. Enable receiving all group messages. This changes incoming events from the
+   mention-only `GROUP_AT_MESSAGE_CREATE` form to the full-mode
+   `GROUP_MESSAGE_CREATE` form.
+
+The desktop client and QQ Open Platform management console may not expose these
+switches. Changing the receive-all setting can require a fresh Gateway session:
+stop the bridge, back up and remove its `state.json`, then start it again and
+confirm the log reports `QQ gateway ready (new)`.
+
+For a safe verification:
+
+- Send one normal group message without mentioning the robot. The service log
+  should show `GROUP_MESSAGE_CREATE` with `addressed=false`; it must not start
+  an Agent task or release a pending result.
+- Mention the robot once. The log should show `addressed=true`, followed by a
+  task acknowledgement.
+- Verify active delivery with a long task. After five minutes, the completed
+  result should arrive without requiring `Status`. If QQ rejects active
+  delivery, the result remains persisted and the next trusted message that
+  explicitly mentions the robot retrieves it.
+
 ## Install
 
 ```bash
@@ -79,7 +110,8 @@ The default persistent directory is:
 ├── state.json
 ├── sessions.json
 ├── logs\
-└── media\
+├── media\
+└── deliveries\
 ```
 
 Use `--instance NAME` during both initialization and startup to select
@@ -160,10 +192,16 @@ Results that outlive their passive-reply window are persisted under the bot
 instance's `deliveries` directory. Text metadata is stored in an atomic state
 file, while artifacts are stored as separate binary files and uploaded again
 when delivery resumes. A restart therefore does not lose completed work.
-The next inbound message delivers pending results before handling a new task.
+For group chats, the bridge first attempts an active message. If the current
+group has not enabled robot push messages, the next message that explicitly
+mentions the robot delivers pending results before handling a new task.
 QQ message IDs confirm platform acceptance; transient failures retry with the
 same `msg_id + msg_seq`, and a duplicate response after an uncertain retry is
 treated as evidence that the first request was accepted.
+
+When receive-all mode is enabled, ordinary group messages are observed but do
+not start Agent tasks or release pending results. All Bot behavior still
+requires explicitly mentioning the robot.
 
 The latest confirmed result remains available for 30 minutes. `Retry` resends
 it with the new inbound message ID and fresh media upload data; `Seen` clears

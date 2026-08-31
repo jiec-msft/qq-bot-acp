@@ -505,6 +505,65 @@ test("long-running group results resume on the next inbound message", async () =
   );
 });
 
+test("long-running group results use active delivery when permission is enabled", async () => {
+  let now = 0;
+  const { sender, sent } = senderFixture(
+    {},
+    undefined,
+    () => now,
+    undefined,
+    true,
+  );
+  const reply = sender.createReply(inboundMessage("group"));
+
+  await reply.sendProgress("Task accepted");
+  now = 5 * 60 * 1000;
+  await reply.write("Task complete");
+  await reply.finish();
+
+  assert.equal(sent.length, 2);
+  assert.equal(sent[1]?.replyToId, undefined);
+  assert.equal(sent[1]?.sequence, undefined);
+  assert.equal(sent[1]?.text, "Task complete");
+  assert.equal(
+    await sender.deliverPending(inboundMessage("group", "fresh")),
+    0,
+  );
+});
+
+test("active group delivery retries after permission is enabled", async () => {
+  let now = 0;
+  let activeGroupMessages = false;
+  const { sender, sent } = senderFixture(
+    {},
+    undefined,
+    () => now,
+    undefined,
+    () => activeGroupMessages,
+  );
+
+  const firstReply = sender.createReply(inboundMessage("group"));
+  await firstReply.sendProgress("First task accepted");
+  now = 5 * 60 * 1000;
+  await firstReply.write("First task complete");
+  await firstReply.finish();
+
+  activeGroupMessages = true;
+  assert.equal(
+    await sender.deliverPending(inboundMessage("group", "fresh")),
+    1,
+  );
+
+  const secondReply = sender.createReply(inboundMessage("group", "second"));
+  await secondReply.sendProgress("Second task accepted");
+  now = 10 * 60 * 1000;
+  await secondReply.write("Second task complete");
+  await secondReply.finish();
+
+  assert.equal(sent.at(-1)?.text, "Second task complete");
+  assert.equal(sent.at(-1)?.replyToId, undefined);
+});
+
 test("expired group heartbeats are skipped instead of sent actively", async () => {
   let now = 0;
   const { sender, sent } = senderFixture({}, undefined, () => now);
@@ -1191,6 +1250,9 @@ test("deferred delivery retries transient failures with a stable sequence", asyn
     {
       sendText: async (input) => {
         if (input.replyToId === "inbound") return "ack";
+        if (!input.replyToId) {
+          throw new QQApiError("send", 400, 40034105);
+        }
         retried.push(input);
         attempts++;
         if (attempts === 1) {
@@ -1259,6 +1321,9 @@ test("a duplicate response after an uncertain retry is treated as accepted", asy
     {
       sendText: async (input) => {
         if (input.replyToId === "inbound") return "ack";
+        if (!input.replyToId) {
+          throw new QQApiError("send", 400, 40034105);
+        }
         attempts++;
         if (attempts === 1) throw new TypeError("response lost");
         throw new QQApiError("send", 400, 40054005);
@@ -1496,6 +1561,7 @@ test("deferred artifacts and final text fit one fresh reply window", async () =>
     operations.slice(1),
     [
       "upload:one",
+      "upload:one",
       "media:1",
       "upload:two",
       "media:2",
@@ -1559,6 +1625,7 @@ function senderFixture(
   ) => Promise<{ id: string; pendingCharacters?: number }>,
   now?: () => number,
   deliveryRoot?: string,
+  activeGroupMessages: boolean | (() => boolean) = false,
 ) {
   const config = createInitialConfig({
     appId: "app",
@@ -1575,6 +1642,15 @@ function senderFixture(
   const sender = new QQSender(
     {
       sendText: async (input) => {
+        if (
+          input.chatType === "group" &&
+          !input.replyToId &&
+          !(typeof activeGroupMessages === "function"
+            ? activeGroupMessages()
+            : activeGroupMessages)
+        ) {
+          throw new QQApiError("send", 400, 40034105);
+        }
         sent.push(input);
         operations.push(`text:${input.sequence}`);
         return `message-${sent.length}`;
@@ -1595,6 +1671,15 @@ function senderFixture(
         return `file-${uploads.length}`;
       },
       sendMedia: async (input) => {
+        if (
+          input.chatType === "group" &&
+          !input.replyToId &&
+          !(typeof activeGroupMessages === "function"
+            ? activeGroupMessages()
+            : activeGroupMessages)
+        ) {
+          throw new QQApiError("media send", 400, 40034105);
+        }
         media.push(input);
         operations.push(`media:${input.sequence}`);
         return `media-${media.length}`;

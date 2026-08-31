@@ -176,7 +176,7 @@ export class QQGateway {
     const message = normalizeInbound(type, data as Record<string, unknown>, this.api.appId);
     if (isMessageDispatch(type)) {
       this.log(
-        `QQ gateway message dispatch type=${type} accepted=${message !== null}`,
+        `QQ gateway message dispatch type=${type} accepted=${message !== null} addressed=${message?.addressed ?? "n/a"}`,
       );
     }
     if (!message) return;
@@ -271,15 +271,10 @@ export function normalizeInbound(
     type === "GROUP_AT_MESSAGE_CREATE" ||
     type === "GROUP_MESSAGE_CREATE"
   ) {
-    if (
-      type === "GROUP_MESSAGE_CREATE" &&
-      (
-        author.bot === true ||
-        !normalizeMentions(event.mentions).some((mention) => mention.bot === true)
-      )
-    ) {
-      return null;
-    }
+    if (author.bot === true) return null;
+    const addressed =
+      type === "GROUP_AT_MESSAGE_CREATE" ||
+      normalizeMentions(event.mentions).some((mention) => mention.bot === true);
     const senderId = String(author.member_openid ?? "");
     const targetId = String(event.group_openid ?? "");
     if (!senderId || !targetId) return null;
@@ -289,6 +284,7 @@ export function normalizeInbound(
       chatType: "group",
       senderId,
       targetId,
+      addressed,
     };
   }
 

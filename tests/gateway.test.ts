@@ -25,7 +25,7 @@ test("a resumed QQ gateway session becomes ready", async () => {
   assert.equal(ready, true);
 });
 
-test("full-mode group events accept bot mentions without consuming all chat", () => {
+test("full-mode group events mark only bot mentions as addressed", () => {
   const event = {
     id: "message",
     author: {
@@ -47,8 +47,8 @@ test("full-mode group events accept bot mentions without consuming all chat", ()
       "GROUP_MESSAGE_CREATE",
       { ...event, mentions: [] },
       "app",
-    ),
-    null,
+    )?.addressed,
+    false,
   );
   assert.equal(
     normalizeInbound(
