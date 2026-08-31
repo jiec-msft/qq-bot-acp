@@ -33,8 +33,8 @@ export interface QQSendMediaInput {
   chatType: "direct" | "group";
   targetId: string;
   fileInfo: string;
-  replyToId: string;
-  sequence: number;
+  replyToId?: string;
+  sequence?: number;
   caption?: string;
 }
 
@@ -312,16 +312,18 @@ export function buildTextMessageBody(input: QQSendTextInput): Record<string, unk
     return {
       msg_type: 2,
       markdown: { content: input.text },
-      msg_id: input.replyToId,
-      msg_seq: input.sequence ?? 1,
+      ...(input.replyToId
+        ? { msg_id: input.replyToId, msg_seq: input.sequence ?? 1 }
+        : {}),
     };
   }
 
   return {
     content: input.text,
     msg_type: 0,
-    msg_id: input.replyToId,
-    msg_seq: input.sequence ?? 1,
+    ...(input.replyToId
+      ? { msg_id: input.replyToId, msg_seq: input.sequence ?? 1 }
+      : {}),
   };
 }
 
@@ -349,8 +351,9 @@ export function buildMediaMessageBody(input: QQSendMediaInput): Record<string, u
     content: input.caption?.trim() || " ",
     msg_type: 7,
     media: { file_info: input.fileInfo },
-    msg_id: input.replyToId,
-    msg_seq: input.sequence,
+    ...(input.replyToId
+      ? { msg_id: input.replyToId, msg_seq: input.sequence ?? 1 }
+      : {}),
   };
 }
 

@@ -476,6 +476,37 @@ test("group fallback batching splits lists only between top-level items", async 
   assert.deepEqual(sent.map(({ sequence }) => sequence), [1, 2]);
 });
 
+test("long-running group replies switch from passive to active messages", async () => {
+  let now = 0;
+  const { sender, sent } = senderFixture({}, undefined, () => now);
+  const reply = sender.createReply(inboundMessage("group"));
+
+  await reply.sendProgress("Task accepted");
+  now = 5 * 60 * 1000;
+  await reply.write("Task complete");
+  await reply.finish();
+
+  assert.equal(sent[0]?.replyToId, "inbound");
+  assert.equal(sent[0]?.sequence, 1);
+  assert.equal(sent[1]?.replyToId, undefined);
+  assert.equal(sent[1]?.sequence, undefined);
+});
+
+test("long-running direct streams start with wakeup enabled", async () => {
+  let now = 0;
+  const { sender, streams } = senderFixture({}, undefined, () => now);
+  const reply = sender.createReply(inboundMessage());
+
+  await reply.sendProgress("Task accepted");
+  now = 5 * 60 * 1000;
+  await reply.write("Task complete");
+  await reply.finish();
+
+  assert.ok(streams.length >= 2);
+  assert.ok(streams.every(({ isWakeup }) => isWakeup === true));
+  assert.ok(streams.every(({ sequence }) => sequence === 2));
+});
+
 test("QQ passive replies are capped and visibly truncated", async () => {
   const { sender, sent } = senderFixture({
     textChunkLimit: 100,
@@ -546,6 +577,34 @@ test("direct and group Markdown use QQ msg_type 2 payloads", () => {
       },
     );
   }
+
+  assert.deepEqual(
+    buildTextMessageBody({
+      chatType: "group",
+      targetId: "target",
+      text: "# Completed",
+      markdown: true,
+    }),
+    {
+      msg_type: 2,
+      markdown: { content: "# Completed" },
+    },
+  );
+});
+
+test("active group media messages omit passive reply identifiers", () => {
+  assert.deepEqual(
+    buildMediaMessageBody({
+      chatType: "group",
+      targetId: "target",
+      fileInfo: "file",
+    }),
+    {
+      content: " ",
+      msg_type: 7,
+      media: { file_info: "file" },
+    },
+  );
 });
 
 test("QQ stream request bodies and responses follow the official contract", () => {
@@ -1023,6 +1082,24 @@ test("ordinary artifacts preserve their file name and use QQ file uploads", asyn
   assert.equal(media[0]?.caption, "Final report");
 });
 
+test("long-running group artifacts use active media messages", async () => {
+  let now = 0;
+  const { sender, media } = senderFixture(
+    { streamResponses: false },
+    undefined,
+    () => now,
+  );
+  const reply = sender.createReply(inboundMessage("group"));
+
+  await reply.sendProgress("Task accepted");
+  now = 5 * 60 * 1000;
+  await reply.sendArtifact(artifact("document", "report.pdf"), "Final report");
+  await reply.finish();
+
+  assert.equal(media[0]?.replyToId, undefined);
+  assert.equal(media[0]?.sequence, undefined);
+});
+
 test("artifacts share reply sequencing and are deduplicated per turn", async () => {
   const { sender, sent, streams, uploads, media, operations } = senderFixture();
   const reply = sender.createReply(inboundMessage());
@@ -1074,6 +1151,7 @@ function senderFixture(
   streamResponse?: (
     input: QQSendStreamInput,
   ) => Promise<{ id: string; pendingCharacters?: number }>,
+  now?: () => number,
 ) {
   const config = createInitialConfig({
     appId: "app",
@@ -1117,6 +1195,7 @@ function senderFixture(
     },
     () => config,
     (message) => logs.push(message),
+    now,
   );
   return { sender, sent, streams, uploads, media, operations, logs };
 }
