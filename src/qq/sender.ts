@@ -44,10 +44,10 @@ let nextStreamTrace = 1;
 type EffectiveMarkdownMode = BotConfig["output"]["markdownMode"];
 
 export interface QQMessageApi {
-  sendText(input: QQSendTextInput): Promise<string | undefined>;
+  sendText(input: QQSendTextInput): Promise<string>;
   sendStream(input: QQSendStreamInput): Promise<QQStreamMessageResponse>;
   uploadMedia(input: QQUploadMediaInput): Promise<string>;
-  sendMedia(input: QQSendMediaInput): Promise<string | undefined>;
+  sendMedia(input: QQSendMediaInput): Promise<string>;
 }
 
 export interface QQReplyStream {
@@ -77,6 +77,7 @@ export class QQSender {
     private readonly getConfig: () => BotConfig,
     private readonly log: (message: string) => void = () => {},
     private readonly now: () => number = Date.now,
+    private readonly retryPause?: (milliseconds: number) => Promise<void>,
   ) {}
 
   createReply(message: QQInboundMessage): QQReplyStream {
@@ -105,36 +106,50 @@ export class QQSender {
   async deliverPending(message: QQInboundMessage): Promise<number> {
     const pending = this.pendingDeliveries.get(message.conversationId);
     if (!pending?.length || message.chatType === "channel") return 0;
+    const chatType = message.chatType;
     let delivered = 0;
     let sequence = 1;
     while (pending.length > 0 && sequence <= pendingReplyLimit(message.chatType)) {
       const item = pending[0]!;
+      let confirmationId: string;
       if (item.kind === "text") {
-        await this.api.sendText({
-          chatType: message.chatType,
-          targetId: message.targetId,
-          text: item.text,
-          replyToId: message.messageId,
-          sequence,
-          markdown: item.markdown,
-        });
+        confirmationId = await this.retryPendingDelivery(
+          "text",
+          () => this.api.sendText({
+            chatType,
+            targetId: message.targetId,
+            text: deliveredText(item.text, delivered === 0),
+            replyToId: message.messageId,
+            sequence,
+            markdown: item.markdown,
+          }),
+        );
       } else {
-        const fileInfo = await this.api.uploadMedia({
-          chatType: message.chatType,
-          targetId: message.targetId,
-          data: item.artifact.data,
-          fileType: qqMediaFileType(item.artifact.kind),
-          fileName: item.artifact.fileName,
-        });
-        await this.api.sendMedia({
-          chatType: message.chatType,
-          targetId: message.targetId,
-          fileInfo,
-          replyToId: message.messageId,
-          sequence,
-          caption: item.caption,
-        });
+        const fileInfo = await this.retryPendingDelivery(
+          "media upload",
+          () => this.api.uploadMedia({
+            chatType,
+            targetId: message.targetId,
+            data: item.artifact.data,
+            fileType: qqMediaFileType(item.artifact.kind),
+            fileName: item.artifact.fileName,
+          }),
+        );
+        confirmationId = await this.retryPendingDelivery(
+          "media send",
+          () => this.api.sendMedia({
+            chatType,
+            targetId: message.targetId,
+            fileInfo,
+            replyToId: message.messageId,
+            sequence,
+            caption: deliveredCaption(item, delivered === 0),
+          }),
+        );
       }
+      this.log(
+        `QQ deferred item confirmed conversation=${conversationLogId(message.conversationId)} kind=${item.kind} sequence=${sequence} confirmation=${confirmationLogId(confirmationId)}`,
+      );
       pending.shift();
       delivered++;
       sequence++;
@@ -227,6 +242,30 @@ export class QQSender {
     this.log(
       `QQ delivery deferred conversation=${conversationLogId(conversationId)} kind=${delivery.kind} pending=${pending.length}`,
     );
+  }
+
+  private async retryPendingDelivery<T>(
+    operation: string,
+    send: () => Promise<T>,
+  ): Promise<T> {
+    const delays = [500, 1_500];
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await send();
+      } catch (error) {
+        if (attempt >= delays.length || !isRetriableDeliveryError(error)) {
+          throw error;
+        }
+        this.log(
+          `QQ deferred ${operation} retrying attempt=${attempt + 2} error=${deliveryErrorCategory(error)}`,
+        );
+        if (this.retryPause) {
+          await this.retryPause(delays[attempt]!);
+        } else {
+          await sleep(delays[attempt]!, this.shutdown.signal);
+        }
+      }
+    }
   }
 }
 
@@ -720,6 +759,43 @@ function pendingReplyLimit(chatType: QQInboundMessage["chatType"]): number {
 
 function conversationLogId(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 12);
+}
+
+function confirmationLogId(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 8);
+}
+
+function deliveredText(text: string, first: boolean): string {
+  return first
+    ? `检测到上次任务已有待发送结果，正在补发。\n\n${text}`
+    : text;
+}
+
+function deliveredCaption(
+  item: Extract<PendingDelivery, { kind: "artifact" }>,
+  first: boolean,
+): string | undefined {
+  if (!first) return item.caption;
+  return `补发结果：${item.caption ?? item.artifact.fileName}`;
+}
+
+function isRetriableDeliveryError(error: unknown): boolean {
+  if (error instanceof QQApiError) {
+    return (
+      error.status === 429 ||
+      error.status >= 500 ||
+      error.code === "missing-message-id" ||
+      error.code === "missing-file-info"
+    );
+  }
+  return error instanceof TypeError;
+}
+
+function deliveryErrorCategory(error: unknown): string {
+  if (error instanceof QQApiError) {
+    return `http-${error.status}${error.code === undefined ? "" : `-code-${error.code}`}`;
+  }
+  return error instanceof Error ? error.name : typeof error;
 }
 
 function capReplyChunks(

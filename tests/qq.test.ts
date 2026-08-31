@@ -496,7 +496,10 @@ test("long-running group results resume on the next inbound message", async () =
   );
   assert.equal(sent[1]?.replyToId, "fresh");
   assert.equal(sent[1]?.sequence, 1);
-  assert.equal(sent[1]?.text, "Task complete");
+  assert.equal(
+    sent[1]?.text,
+    "检测到上次任务已有待发送结果，正在补发。\n\nTask complete",
+  );
 });
 
 test("expired group heartbeats are skipped instead of sent actively", async () => {
@@ -746,6 +749,38 @@ test("QQ API posts stream frames to the direct stream endpoint", async () => {
       msg_id: "inbound",
       msg_seq: 1,
     });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("QQ API requires a message ID to confirm delivery acceptance", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    if (String(input).includes("/getAppAccessToken")) {
+      return new Response(JSON.stringify({
+        access_token: "token",
+        expires_in: 7200,
+      }), { status: 200 });
+    }
+    return new Response("{}", {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  try {
+    const api = new QQApi("app", "secret");
+    await assert.rejects(
+      api.sendText({
+        chatType: "group",
+        targetId: "group",
+        text: "result",
+        replyToId: "inbound",
+        sequence: 1,
+      }),
+      /missing-message-id/,
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1118,6 +1153,76 @@ test("ordinary artifacts preserve their file name and use QQ file uploads", asyn
   assert.equal(media[0]?.caption, "Final report");
 });
 
+test("deferred delivery retries transient failures with a stable sequence", async () => {
+  const config = createInitialConfig({
+    appId: "app",
+    clientSecretFile: "/unused",
+    agentCommand: "agent",
+  });
+  let now = 0;
+  let attempts = 0;
+  const retried: QQSendTextInput[] = [];
+  const pauses: number[] = [];
+  const logs: string[] = [];
+  const sender = new QQSender(
+    {
+      sendText: async (input) => {
+        if (input.replyToId === "inbound") return "ack";
+        retried.push(input);
+        attempts++;
+        if (attempts === 1) {
+          throw new QQApiError("send", 503, "temporary");
+        }
+        return "confirmed-message";
+      },
+      sendStream: async () => ({ id: "stream" }),
+      uploadMedia: async () => "file",
+      sendMedia: async () => "media",
+    },
+    () => config,
+    (message) => logs.push(message),
+    () => now,
+    async (milliseconds) => {
+      pauses.push(milliseconds);
+    },
+  );
+  const reply = sender.createReply(inboundMessage("group"));
+
+  await reply.sendProgress("Task accepted");
+  now = 5 * 60 * 1000;
+  await reply.write("Task complete");
+  await reply.finish();
+  assert.equal(
+    await sender.deliverPending(inboundMessage("group", "fresh")),
+    1,
+  );
+
+  assert.equal(attempts, 2);
+  assert.deepEqual(pauses, [500]);
+  assert.deepEqual(
+    retried.map(({ replyToId, sequence, text }) => ({
+      replyToId,
+      sequence,
+      text,
+    })),
+    [
+      {
+        replyToId: "fresh",
+        sequence: 1,
+        text: "检测到上次任务已有待发送结果，正在补发。\n\nTask complete",
+      },
+      {
+        replyToId: "fresh",
+        sequence: 1,
+        text: "检测到上次任务已有待发送结果，正在补发。\n\nTask complete",
+      },
+    ],
+  );
+  assert.ok(logs.some((entry) => entry.includes("retrying attempt=2")));
+  assert.ok(logs.some((entry) => entry.includes("item confirmed")));
+  assert.ok(logs.every((entry) => !entry.includes("confirmed-message")));
+});
+
 test("long-running group artifacts resume on the next inbound message", async () => {
   let now = 0;
   const { sender, media } = senderFixture(
@@ -1139,7 +1244,7 @@ test("long-running group artifacts resume on the next inbound message", async ()
   );
   assert.equal(media[0]?.replyToId, "fresh");
   assert.equal(media[0]?.sequence, 1);
-  assert.equal(media[0]?.caption, "Final report");
+  assert.equal(media[0]?.caption, "补发结果：Final report");
 });
 
 test("deferred artifacts and final text fit one fresh reply window", async () => {
