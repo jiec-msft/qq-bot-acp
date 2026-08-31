@@ -134,7 +134,7 @@ export class QQApi {
     return body.url;
   }
 
-  async sendText(input: QQSendTextInput): Promise<string | undefined> {
+  async sendText(input: QQSendTextInput): Promise<string> {
     const body = buildTextMessageBody(input);
     const endpoint =
       input.chatType === "direct"
@@ -147,11 +147,11 @@ export class QQApi {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
     });
-    const result = (await response.json().catch(() => ({}))) as { id?: string; message?: string };
+    const result = (await response.json().catch(() => ({}))) as Record<string, unknown>;
     if (!response.ok) {
-      throw new Error(`QQ send failed (${response.status}): ${JSON.stringify(result)}`);
+      throw qqApiError("send", response, result);
     }
-    return result.id;
+    return confirmedMessageId("send", response, result);
   }
 
   async uploadMedia(input: QQUploadMediaInput): Promise<string> {
@@ -166,17 +166,21 @@ export class QQApi {
         buildMediaUploadBody(input.data, input.fileType, input.fileName),
       ),
     });
-    const result = (await response.json().catch(() => ({}))) as {
-      file_info?: string;
-      message?: string;
-    };
-    if (!response.ok || !result.file_info) {
-      throw new Error(`QQ media upload failed (${response.status}): ${JSON.stringify(result)}`);
+    const result = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!response.ok) {
+      throw qqApiError("media upload", response, result);
+    }
+    if (typeof result.file_info !== "string" || !result.file_info.trim()) {
+      throw new QQApiError(
+        "media upload confirmation",
+        response.status,
+        "missing-file-info",
+      );
     }
     return result.file_info;
   }
 
-  async sendMedia(input: QQSendMediaInput): Promise<string | undefined> {
+  async sendMedia(input: QQSendMediaInput): Promise<string> {
     const endpoint =
       input.chatType === "direct"
         ? `/v2/users/${encodeURIComponent(input.targetId)}/messages`
@@ -186,14 +190,11 @@ export class QQApi {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(buildMediaMessageBody(input)),
     });
-    const result = (await response.json().catch(() => ({}))) as {
-      id?: string;
-      message?: string;
-    };
+    const result = (await response.json().catch(() => ({}))) as Record<string, unknown>;
     if (!response.ok) {
-      throw new Error(`QQ media send failed (${response.status}): ${JSON.stringify(result)}`);
+      throw qqApiError("media send", response, result);
     }
-    return result.id;
+    return confirmedMessageId("media send", response, result);
   }
 
   async sendStream(input: QQSendStreamInput): Promise<QQStreamMessageResponse> {
@@ -428,6 +429,21 @@ function qqApiError(
     response.status,
     code,
     traceId,
+  );
+}
+
+function confirmedMessageId(
+  operation: string,
+  response: Response,
+  result: Record<string, unknown>,
+): string {
+  if (typeof result.id === "string" && result.id.trim()) {
+    return result.id;
+  }
+  throw new QQApiError(
+    `${operation} confirmation`,
+    response.status,
+    "missing-message-id",
   );
 }
 
