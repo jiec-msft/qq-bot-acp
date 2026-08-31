@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   ArtifactKind,
   PreparedArtifact,
@@ -51,6 +52,7 @@ export interface QQMessageApi {
 
 export interface QQReplyStream {
   sendProgress(text: string): Promise<void>;
+  getLastDeliveryAt(): number | undefined;
   write(text: string): Promise<void>;
   flush(): Promise<void>;
   sendArtifact(
@@ -68,6 +70,7 @@ export interface QQStreamingDiagnosticOptions {
 
 export class QQSender {
   private readonly shutdown = new AbortController();
+  private readonly pendingDeliveries = new Map<string, PendingDelivery[]>();
 
   constructor(
     private readonly api: QQMessageApi,
@@ -85,6 +88,7 @@ export class QQSender {
       false,
       true,
       this.now,
+      (delivery) => this.deferDelivery(message.conversationId, delivery),
     );
   }
 
@@ -96,6 +100,52 @@ export class QQSender {
     const reply = this.createReply(message);
     await reply.write(text);
     await reply.finish();
+  }
+
+  async deliverPending(message: QQInboundMessage): Promise<number> {
+    const pending = this.pendingDeliveries.get(message.conversationId);
+    if (!pending?.length || message.chatType === "channel") return 0;
+    let delivered = 0;
+    let sequence = 1;
+    while (pending.length > 0 && sequence <= pendingReplyLimit(message.chatType)) {
+      const item = pending[0]!;
+      if (item.kind === "text") {
+        await this.api.sendText({
+          chatType: message.chatType,
+          targetId: message.targetId,
+          text: item.text,
+          replyToId: message.messageId,
+          sequence,
+          markdown: item.markdown,
+        });
+      } else {
+        const fileInfo = await this.api.uploadMedia({
+          chatType: message.chatType,
+          targetId: message.targetId,
+          data: item.artifact.data,
+          fileType: qqMediaFileType(item.artifact.kind),
+          fileName: item.artifact.fileName,
+        });
+        await this.api.sendMedia({
+          chatType: message.chatType,
+          targetId: message.targetId,
+          fileInfo,
+          replyToId: message.messageId,
+          sequence,
+          caption: item.caption,
+        });
+      }
+      pending.shift();
+      delivered++;
+      sequence++;
+    }
+    if (pending.length === 0) {
+      this.pendingDeliveries.delete(message.conversationId);
+    }
+    this.log(
+      `QQ deferred delivery resumed conversation=${conversationLogId(message.conversationId)} delivered=${delivered} remaining=${pending.length}`,
+    );
+    return delivered;
   }
 
   async runStreamingDiagnostic(
@@ -117,6 +167,7 @@ export class QQSender {
       options.isWakeup === true,
       false,
       this.now,
+      () => {},
     );
     const pause = options.pause;
     if (options.delayMinutes !== undefined) {
@@ -165,12 +216,29 @@ export class QQSender {
       throw error;
     }
   }
+
+  private deferDelivery(
+    conversationId: string,
+    delivery: PendingDelivery,
+  ): void {
+    const pending = this.pendingDeliveries.get(conversationId) ?? [];
+    pending.push(delivery);
+    this.pendingDeliveries.set(conversationId, pending);
+    this.log(
+      `QQ delivery deferred conversation=${conversationLogId(conversationId)} kind=${delivery.kind} pending=${pending.length}`,
+    );
+  }
 }
+
+type PendingDelivery =
+  | { kind: "text"; text: string; markdown: boolean }
+  | { kind: "artifact"; artifact: PreparedArtifact; caption?: string };
 
 class BufferedQQReply implements QQReplyStream {
   private buffer = "";
   private sent = 0;
   private artifactsSent = 0;
+  private deferredDeliveries = 0;
   private readonly artifactDigests = new Set<string>();
   private finished = false;
   private operationChain = Promise.resolve();
@@ -185,6 +253,7 @@ class BufferedQQReply implements QQReplyStream {
   private streamRecovered = false;
   private readonly streamTrace = nextStreamTrace++;
   private readonly createdAt: number;
+  private lastDeliveryAt?: number;
 
   constructor(
     private readonly api: QQMessageApi,
@@ -194,6 +263,7 @@ class BufferedQQReply implements QQReplyStream {
     private readonly forceWakeup = false,
     private readonly allowRecovery = true,
     private readonly now: () => number = Date.now,
+    private readonly deferDelivery: (delivery: PendingDelivery) => void,
   ) {
     this.createdAt = now();
   }
@@ -204,6 +274,10 @@ class BufferedQQReply implements QQReplyStream {
 
   sendProgress(text: string): Promise<void> {
     return this.enqueue(() => this.sendProgressNow(text));
+  }
+
+  getLastDeliveryAt(): number | undefined {
+    return this.lastDeliveryAt;
   }
 
   flush(): Promise<void> {
@@ -238,6 +312,11 @@ class BufferedQQReply implements QQReplyStream {
     if (this.finished) throw new Error("Cannot write to a finished QQ reply");
     const rendered = this.render(text);
     if (!rendered) return;
+    const passive = this.passiveReplyAvailable();
+    if (!passive) {
+      this.log("QQ progress update skipped because the passive reply window expired");
+      return;
+    }
     await this.api.sendText({
       chatType: this.message.chatType,
       targetId: this.message.targetId,
@@ -246,6 +325,7 @@ class BufferedQQReply implements QQReplyStream {
       sequence: this.allocateSequence(),
       markdown: this.effectiveMarkdownMode() === "native",
     });
+    this.markDelivered();
   }
 
   private async flushNow(): Promise<void> {
@@ -278,8 +358,18 @@ class BufferedQQReply implements QQReplyStream {
     if (this.usesOfficialStream()) {
       await this.flushStreamUpdate();
     }
-    if (this.sent >= this.maxPassiveReplies() - FINAL_REPLY_RESERVE) {
+    if (this.availableReplySlots() <= FINAL_REPLY_RESERVE) {
       throw new Error("No QQ reply slot remains for another artifact");
+    }
+    if (!this.passiveReplyAvailable()) {
+      this.defer({
+        kind: "artifact",
+        artifact,
+        caption: caption ? renderMarkdownForQQ(caption) : undefined,
+      });
+      this.artifactsSent++;
+      this.artifactDigests.add(artifact.digest);
+      return { alreadySent: false };
     }
 
     const fileInfo = await this.api.uploadMedia({
@@ -289,15 +379,15 @@ class BufferedQQReply implements QQReplyStream {
       fileType: qqMediaFileType(artifact.kind),
       fileName: artifact.fileName,
     });
-    const passive = this.passiveReplyAvailable();
     await this.api.sendMedia({
       chatType: this.message.chatType,
       targetId: this.message.targetId,
       fileInfo,
-      replyToId: passive ? this.message.messageId : undefined,
-      sequence: passive ? this.allocateSequence() : undefined,
+      replyToId: this.message.messageId,
+      sequence: this.allocateSequence(),
       caption: caption ? renderMarkdownForQQ(caption) : undefined,
     });
+    this.markDelivered();
     this.artifactsSent++;
     this.artifactDigests.add(artifact.digest);
     return { alreadySent: false };
@@ -336,6 +426,7 @@ class BufferedQQReply implements QQReplyStream {
   }
 
   private async flushProgressive(): Promise<void> {
+    if (!this.passiveReplyAvailable()) return;
     const maxLength = Math.max(
       this.output.streamMinChars,
       this.output.textChunkLimit - STREAM_LENGTH_MARGIN,
@@ -473,6 +564,7 @@ class BufferedQQReply implements QQReplyStream {
     this.log(
       `QQ stream frame accepted trace=${this.streamTrace} index=${frameIndex} state=${state} chars=${countCharacters(text)} pending=${response.pendingCharacters ?? "unknown"}`,
     );
+    this.markDelivered();
   }
 
   private canRecoverExpiredStream(error: unknown): boolean {
@@ -535,15 +627,23 @@ class BufferedQQReply implements QQReplyStream {
 
   private async sendChunks(chunks: string[]): Promise<void> {
     for (const text of chunks) {
-      const passive = this.passiveReplyAvailable();
+      if (!this.passiveReplyAvailable()) {
+        this.defer({
+          kind: "text",
+          text,
+          markdown: this.effectiveMarkdownMode() === "native",
+        });
+        continue;
+      }
       await this.api.sendText({
         chatType: this.message.chatType,
         targetId: this.message.targetId,
         text,
-        replyToId: passive ? this.message.messageId : undefined,
-        sequence: passive ? this.allocateSequence() : undefined,
+        replyToId: this.message.messageId,
+        sequence: this.allocateSequence(),
         markdown: this.effectiveMarkdownMode() === "native",
       });
+      this.markDelivered();
     }
   }
 
@@ -567,16 +667,13 @@ class BufferedQQReply implements QQReplyStream {
   }
 
   private passiveReplyAvailable(): boolean {
-    return (
-      this.message.chatType === "direct" ||
-      this.now() - this.createdAt < PASSIVE_REPLY_SAFE_MS
-    );
+    return this.now() - this.createdAt < PASSIVE_REPLY_SAFE_MS;
   }
 
   private availableReplySlots(): number {
     return this.passiveReplyAvailable()
       ? this.maxPassiveReplies() - this.sent
-      : this.maxPassiveReplies();
+      : this.maxPassiveReplies() - this.deferredDeliveries;
   }
 
   private shouldWakeup(): boolean {
@@ -585,6 +682,15 @@ class BufferedQQReply implements QQReplyStream {
       this.streamRecovered ||
       this.now() - this.createdAt >= PASSIVE_REPLY_SAFE_MS
     );
+  }
+
+  private markDelivered(): void {
+    this.lastDeliveryAt = this.now();
+  }
+
+  private defer(delivery: PendingDelivery): void {
+    this.deferDelivery(delivery);
+    this.deferredDeliveries++;
   }
 }
 
@@ -599,6 +705,21 @@ function qqMediaFileType(kind: ArtifactKind): QQMediaFileType {
     case "file":
       return 4;
   }
+}
+
+function pendingReplyLimit(chatType: QQInboundMessage["chatType"]): number {
+  switch (chatType) {
+    case "direct":
+      return DIRECT_MAX_PASSIVE_REPLIES;
+    case "group":
+      return GROUP_MAX_PASSIVE_REPLIES;
+    case "channel":
+      return CHANNEL_MAX_PASSIVE_REPLIES;
+  }
+}
+
+function conversationLogId(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 12);
 }
 
 function capReplyChunks(

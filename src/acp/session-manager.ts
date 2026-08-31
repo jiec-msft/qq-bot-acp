@@ -24,11 +24,16 @@ interface ManagedSession {
   active: boolean;
   pendingOperations: number;
   lastActivity: number;
+  turnStartedAt?: number;
+  lastAgentActivityAt?: number;
+  lastAgentActivity?: string;
 }
 
 export interface PromptCallbacks {
   onText: (text: string) => Promise<void>;
   onThought?: (text: string) => Promise<void>;
+  onActivity?: (activity: string) => Promise<void>;
+  onStateChange?: (state: "starting" | "running") => Promise<void>;
   onArtifact?: (
     artifact: PreparedArtifact,
     caption?: string,
@@ -98,32 +103,51 @@ export class SessionManager {
     prompt: acp.ContentBlock[],
     callbacks: PromptCallbacks,
   ): Promise<void> {
-    return this.serialize(key, () => this.enqueue(key, async (session) => {
-      await session.agent.client.beginTurn(
-        callbacks,
-        this.config.output.showThoughts,
-        callbacks.policy,
-      );
-      session.artifacts.beginTurn(
-        callbacks.onArtifact ??
-          (async () => {
-            throw new Error("Artifact delivery is unavailable for this turn");
-          }),
-      );
-      session.active = true;
-      try {
-        await session.agent.connection.prompt({
-          sessionId: session.agent.sessionId,
-          prompt,
-        });
-        await session.agent.client.flush();
-        await this.state.setSessionId(key, this.config.agent, session.agent.sessionId);
-      } finally {
-        session.artifacts.endTurn();
-        session.active = false;
-        session.lastActivity = Date.now();
-      }
-    }));
+    return this.serialize(key, async () => {
+      await callbacks.onStateChange?.("starting");
+      return this.enqueue(key, async (session) => {
+        await callbacks.onStateChange?.("running");
+        await session.agent.client.beginTurn(
+          {
+            ...callbacks,
+            onActivity: async (activity) => {
+              session.lastAgentActivityAt = Date.now();
+              session.lastAgentActivity = activity;
+              await callbacks.onActivity?.(activity);
+            },
+          },
+          this.config.output.showThoughts,
+          callbacks.policy,
+        );
+        session.artifacts.beginTurn(
+          callbacks.onArtifact ??
+            (async () => {
+              throw new Error("Artifact delivery is unavailable for this turn");
+            }),
+        );
+        session.active = true;
+        session.turnStartedAt = Date.now();
+        session.lastAgentActivityAt = session.turnStartedAt;
+        session.lastAgentActivity = "正在启动 Agent";
+        try {
+          await session.agent.connection.prompt({
+            sessionId: session.agent.sessionId,
+            prompt,
+          });
+          await session.agent.client.flush();
+          await this.state.setSessionId(
+            key,
+            this.config.agent,
+            session.agent.sessionId,
+          );
+        } finally {
+          session.artifacts.endTurn();
+          session.active = false;
+          session.turnStartedAt = undefined;
+          session.lastActivity = Date.now();
+        }
+      });
+    });
   }
 
   async cancel(key: string): Promise<boolean> {
@@ -224,6 +248,11 @@ export class SessionManager {
     pendingSessions: number;
     activeTurns: number;
     maxConcurrent: number;
+    conversationPending: boolean;
+    turnStartedAt?: number;
+    lastAgentActivityAt?: number;
+    lastAgentActivity?: string;
+    agentProcessAlive: boolean;
     options: Record<string, string | boolean>;
   }> {
     const session = this.sessions.get(key);
@@ -236,6 +265,17 @@ export class SessionManager {
         (candidate) => candidate.active,
       ).length,
       maxConcurrent: this.config.sessions.maxConcurrent,
+      conversationPending:
+        (this.pendingOperationReservations.get(key) ?? 0) > 0 ||
+        Boolean(session && !session.active && session.pendingOperations > 0),
+      turnStartedAt: session?.turnStartedAt,
+      lastAgentActivityAt: session?.lastAgentActivityAt,
+      lastAgentActivity: session?.lastAgentActivity,
+      agentProcessAlive: Boolean(
+        session &&
+        session.agent.process.exitCode === null &&
+        !session.agent.process.killed
+      ),
       options: {
         ...this.config.sessions.defaultOptions,
         ...await this.state.getOptions(key, this.config.agent),

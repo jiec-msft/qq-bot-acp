@@ -75,3 +75,42 @@ test("ACP writes reject dangling symlinks and turn policy escapes", async (t) =>
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test("ACP activity remains observable when thoughts are hidden", async () => {
+  const activities: string[] = [];
+  const thoughts: string[] = [];
+  const client = new QQBotAcpClient(process.cwd());
+  await client.beginTurn(
+    {
+      onText: async () => {},
+      onThought: async (text) => {
+        thoughts.push(text);
+      },
+      onActivity: async (activity) => {
+        activities.push(activity);
+      },
+    },
+    false,
+  );
+
+  await client.sessionUpdate({
+    sessionId: "session",
+    update: {
+      sessionUpdate: "agent_thought_chunk",
+      content: { type: "text", text: "private reasoning" },
+    },
+  });
+  await client.sessionUpdate({
+    sessionId: "session",
+    update: {
+      sessionUpdate: "tool_call",
+      toolCallId: "tool",
+      title: "Edit a file",
+      kind: "edit",
+      status: "in_progress",
+    },
+  });
+
+  assert.deepEqual(thoughts, []);
+  assert.deepEqual(activities, ["正在分析任务", "正在编辑文件"]);
+});

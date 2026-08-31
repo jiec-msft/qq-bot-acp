@@ -476,7 +476,7 @@ test("group fallback batching splits lists only between top-level items", async 
   assert.deepEqual(sent.map(({ sequence }) => sequence), [1, 2]);
 });
 
-test("long-running group replies switch from passive to active messages", async () => {
+test("long-running group results resume on the next inbound message", async () => {
   let now = 0;
   const { sender, sent } = senderFixture({}, undefined, () => now);
   const reply = sender.createReply(inboundMessage("group"));
@@ -488,8 +488,44 @@ test("long-running group replies switch from passive to active messages", async 
 
   assert.equal(sent[0]?.replyToId, "inbound");
   assert.equal(sent[0]?.sequence, 1);
-  assert.equal(sent[1]?.replyToId, undefined);
-  assert.equal(sent[1]?.sequence, undefined);
+  assert.equal(sent.length, 1);
+
+  assert.equal(
+    await sender.deliverPending(inboundMessage("group", "fresh")),
+    1,
+  );
+  assert.equal(sent[1]?.replyToId, "fresh");
+  assert.equal(sent[1]?.sequence, 1);
+  assert.equal(sent[1]?.text, "Task complete");
+});
+
+test("expired group heartbeats are skipped instead of sent actively", async () => {
+  let now = 0;
+  const { sender, sent } = senderFixture({}, undefined, () => now);
+  const reply = sender.createReply(inboundMessage("group"));
+
+  await reply.sendProgress("Task accepted");
+  now = 5 * 60 * 1000;
+  await reply.sendProgress("Still running");
+
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0]?.replyToId, "inbound");
+  assert.equal(sent[0]?.sequence, 1);
+  assert.equal(reply.getLastDeliveryAt(), 0);
+});
+
+test("expired direct heartbeats are skipped instead of sent actively", async () => {
+  let now = 0;
+  const { sender, sent } = senderFixture({}, undefined, () => now);
+  const reply = sender.createReply(inboundMessage());
+
+  await reply.sendProgress("Task accepted");
+  now = 5 * 60 * 1000;
+  await reply.sendProgress("Still running");
+
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0]?.replyToId, "inbound");
+  assert.equal(sent[0]?.sequence, 1);
 });
 
 test("long-running direct streams start with wakeup enabled", async () => {
@@ -1082,7 +1118,7 @@ test("ordinary artifacts preserve their file name and use QQ file uploads", asyn
   assert.equal(media[0]?.caption, "Final report");
 });
 
-test("long-running group artifacts use active media messages", async () => {
+test("long-running group artifacts resume on the next inbound message", async () => {
   let now = 0;
   const { sender, media } = senderFixture(
     { streamResponses: false },
@@ -1096,8 +1132,50 @@ test("long-running group artifacts use active media messages", async () => {
   await reply.sendArtifact(artifact("document", "report.pdf"), "Final report");
   await reply.finish();
 
-  assert.equal(media[0]?.replyToId, undefined);
-  assert.equal(media[0]?.sequence, undefined);
+  assert.equal(media.length, 0);
+  assert.equal(
+    await sender.deliverPending(inboundMessage("group", "fresh")),
+    1,
+  );
+  assert.equal(media[0]?.replyToId, "fresh");
+  assert.equal(media[0]?.sequence, 1);
+  assert.equal(media[0]?.caption, "Final report");
+});
+
+test("deferred artifacts and final text fit one fresh reply window", async () => {
+  let now = 0;
+  const { sender, sent, media, operations } = senderFixture(
+    { streamResponses: false, textChunkLimit: 100 },
+    undefined,
+    () => now,
+  );
+  const reply = sender.createReply(inboundMessage("group"));
+
+  await reply.sendProgress("Task accepted");
+  now = 5 * 60 * 1000;
+  await reply.sendArtifact(artifact("one", "one.pdf"), "One");
+  await reply.sendArtifact(artifact("two", "two.pdf"), "Two");
+  await reply.write("x".repeat(500));
+  await reply.finish();
+
+  assert.equal(sent.length, 1);
+  assert.equal(media.length, 0);
+  assert.equal(
+    await sender.deliverPending(inboundMessage("group", "fresh")),
+    5,
+  );
+  assert.deepEqual(
+    operations.slice(1),
+    [
+      "upload:one",
+      "media:1",
+      "upload:two",
+      "media:2",
+      "text:3",
+      "text:4",
+      "text:5",
+    ],
+  );
 });
 
 test("artifacts share reply sequencing and are deduplicated per turn", async () => {
