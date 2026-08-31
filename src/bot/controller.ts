@@ -40,7 +40,17 @@ export class BotController {
   }
 
   async handleMessage(message: QQInboundMessage): Promise<void> {
-    if (!shouldHandleMessage(message)) return;
+    const disposition = inboundMessageDisposition(message);
+    if (disposition === "ignore") return;
+    if (disposition === "warn-literal-mention") {
+      if (this.isAllowed(message)) {
+        await this.sender.reply(
+          message,
+          "这条消息里的 @Copilot 是普通文本，不是 QQ 的真实 @ 提及，所以任务没有执行。为避免普通群聊意外触发 Agent，Bot 只处理从 QQ 的 @ 列表中选择 Copilot 后发送的消息。请重新输入 @，从列表选择 Copilot，再发送任务。",
+        );
+      }
+      return;
+    }
     const command = parseControlCommand(message.text);
 
     if (command?.kind === "id") {
@@ -607,8 +617,22 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-export function shouldHandleMessage(message: QQInboundMessage): boolean {
-  return message.addressed !== false;
+export type InboundMessageDisposition =
+  | "handle"
+  | "warn-literal-mention"
+  | "ignore";
+
+export function inboundMessageDisposition(
+  message: QQInboundMessage,
+): InboundMessageDisposition {
+  if (message.addressed !== false) return "handle";
+  if (
+    message.chatType === "group" &&
+    /^@copilot\b/i.test(message.text.trimStart())
+  ) {
+    return "warn-literal-mention";
+  }
+  return "ignore";
 }
 
 function helpText(): string {

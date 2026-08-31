@@ -57,6 +57,9 @@ For a safe verification:
 - Send one normal group message without mentioning the robot. The service log
   should show `GROUP_MESSAGE_CREATE` with `addressed=false`; it must not start
   an Agent task or release a pending result.
+- Typing `@Copilot` as plain text does not count as a mention. For trusted
+  users, the Bot replies with a safety explanation but does not start an Agent
+  task. Type `@`, then select Copilot from QQ's mention list.
 - Mention the robot once. The log should show `addressed=true`, followed by a
   task acknowledgement.
 - Verify active delivery with a long task. After five minutes, the completed
