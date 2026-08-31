@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { QQApi } from "../src/qq/api.js";
-import { QQGateway } from "../src/qq/gateway.js";
+import { normalizeInbound, QQGateway } from "../src/qq/gateway.js";
 
 test("a resumed QQ gateway session becomes ready", async () => {
   const gateway = new QQGateway(
@@ -23,4 +23,39 @@ test("a resumed QQ gateway session becomes ready", async () => {
     new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 25)),
   ]);
   assert.equal(ready, true);
+});
+
+test("full-mode group events accept bot mentions without consuming all chat", () => {
+  const event = {
+    id: "message",
+    author: {
+      member_openid: "member",
+      bot: false,
+    },
+    group_openid: "group",
+    content: "make a presentation",
+    timestamp: "2026-08-31T12:24:00+08:00",
+    mentions: [{ id: "bot", bot: true }],
+  };
+
+  assert.equal(
+    normalizeInbound("GROUP_MESSAGE_CREATE", event, "app")?.text,
+    "make a presentation",
+  );
+  assert.equal(
+    normalizeInbound(
+      "GROUP_MESSAGE_CREATE",
+      { ...event, mentions: [] },
+      "app",
+    ),
+    null,
+  );
+  assert.equal(
+    normalizeInbound(
+      "GROUP_MESSAGE_CREATE",
+      { ...event, author: { member_openid: "bot", bot: true } },
+      "app",
+    ),
+    null,
+  );
 });
