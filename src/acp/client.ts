@@ -11,7 +11,68 @@ export interface TurnPolicy {
 export interface TurnCallbacks {
   onText: (text: string) => Promise<void>;
   onThought?: (text: string) => Promise<void>;
+  onActivity?: (activity: string) => Promise<void>;
   onComplete?: () => Promise<void>;
+}
+
+function describeActivity(update: acp.SessionUpdate): string {
+  switch (update.sessionUpdate) {
+    case "agent_message_chunk":
+      return "正在撰写回复";
+    case "agent_thought_chunk":
+      return "正在分析任务";
+    case "tool_call":
+      return describeToolActivity(update.kind, update.status);
+    case "tool_call_update":
+      return describeToolActivity(
+        update.kind ?? undefined,
+        update.status ?? undefined,
+      );
+    case "plan": {
+      const current = update.entries.find(
+        (entry) => entry.status === "in_progress",
+      );
+      return current
+        ? `当前步骤：${truncateActivity(current.content)}`
+        : "正在更新执行计划";
+    }
+    default:
+      return "Agent 状态已更新";
+  }
+}
+
+function describeToolActivity(
+  kind: acp.ToolKind | undefined,
+  status: acp.ToolCallStatus | undefined,
+): string {
+  const action = (() => {
+    switch (kind) {
+      case "read":
+        return "读取资料";
+      case "edit":
+        return "编辑文件";
+      case "delete":
+        return "删除文件";
+      case "move":
+        return "整理文件";
+      case "search":
+        return "搜索资料";
+      case "execute":
+        return "执行命令";
+      case "think":
+        return "分析任务";
+      case "fetch":
+        return "获取资料";
+      default:
+        return "使用工具";
+    }
+  })();
+  return status === "failed" ? `${action}失败` : `正在${action}`;
+}
+
+function truncateActivity(value: string): string {
+  const compact = value.replace(/\s+/g, " ").trim();
+  return compact.length <= 80 ? compact : `${compact.slice(0, 77)}...`;
 }
 
 export class QQBotAcpClient implements acp.Client {
@@ -57,6 +118,10 @@ export class QQBotAcpClient implements acp.Client {
   sessionUpdate(params: acp.SessionNotification): Promise<void> {
     return this.enqueue(async () => {
       const update = params.update;
+      await this.invoke(
+        this.callbacks.onActivity,
+        describeActivity(update),
+      );
       if (
         update.sessionUpdate === "agent_message_chunk" &&
         update.content.type === "text"

@@ -17,6 +17,7 @@ import type { QQInboundMessage } from "../qq/types.js";
 import { AttachmentStager } from "../uploads/stager.js";
 import { WorkspaceRepository } from "../workspace/repository.js";
 import { parseControlCommand, type ControlCommand } from "./commands.js";
+import { TaskProgressReporter } from "./task-progress.js";
 
 export class BotController {
   private readonly reviewedProposals = new Map<string, string>();
@@ -104,6 +105,9 @@ export class BotController {
       await this.sender.reply(message, "你没有使用此机器人的权限。");
       return;
     }
+    if (await this.sender.deliverPending(message) > 0) {
+      return;
+    }
     if (command?.kind === "help") {
       await this.sender.reply(message, helpText());
       return;
@@ -169,29 +173,25 @@ export class BotController {
     const reply = this.sender.createReply(message);
     let thoughtStarted = false;
     let answerStarted = false;
-    let agentOutputStarted = false;
+    const taskId = conversationKey(message.conversationId);
+    const startedAt = Date.now();
+    this.log(`QQ task started conversation=${taskId}`);
     try {
       await reply.sendProgress(
-        "任务已接收，正在处理或排队。复杂文档和 PPT 可能需要较长时间；发送 Stop 可取消。",
+        "任务已接收，正在处理或排队。QQ群不允许 Bot 主动发消息；若任务超过 5 分钟，请发送 Status 查询状态或取回已完成结果。发送 Stop 可取消。",
       );
     } catch (error) {
       this.log(`QQ task acknowledgement failed: ${errorMessage(error)}`);
     }
-    const progressTimer = message.chatType === "direct"
-      ? undefined
-      : setTimeout(() => {
-          if (agentOutputStarted) return;
-          void reply.sendProgress(
-            "任务仍在处理或排队。完成后会主动发送结果；发送 Status 可查看状态，发送 Stop 可取消。",
-          ).catch((error) => {
-            this.log(`QQ task progress update failed: ${errorMessage(error)}`);
-          });
-        }, 2 * 60 * 1000);
-    progressTimer?.unref();
+    const progress = new TaskProgressReporter(
+      reply,
+      () => this.sessions.getRuntimeStatus(message.conversationId),
+      this.log,
+    );
+    progress.start();
     try {
       await this.sessions.prompt(message.conversationId, prompt, {
         onText: async (text) => {
-          agentOutputStarted = true;
           if (thoughtStarted && !answerStarted) {
             answerStarted = true;
             await reply.write("\n\n## Answer\n\n");
@@ -199,22 +199,30 @@ export class BotController {
           await reply.write(text);
         },
         onThought: async (text) => {
-          agentOutputStarted = true;
           if (!thoughtStarted) {
             thoughtStarted = true;
             await reply.write("## Thought\n\n");
           }
           await reply.write(text);
         },
-        onArtifact: (artifact, caption) => {
-          agentOutputStarted = true;
-          return reply.sendArtifact(artifact, caption);
+        onArtifact: (artifact, caption) =>
+          reply.sendArtifact(artifact, caption),
+        onStateChange: async (state) => {
+          progress.setPhase(state);
         },
         onComplete: () => reply.finish(),
         policy,
       });
+      this.log(
+        `QQ task completed conversation=${taskId} elapsedMs=${Date.now() - startedAt}`,
+      );
+    } catch (error) {
+      this.log(
+        `QQ task failed conversation=${taskId} elapsedMs=${Date.now() - startedAt} error=${errorMessage(error)}`,
+      );
+      throw error;
     } finally {
-      if (progressTimer) clearTimeout(progressTimer);
+      progress.stop();
     }
   }
 
@@ -231,12 +239,15 @@ export class BotController {
           `Mode: ${String(mode)}`,
           `Model: ${String(sessions.options.model ?? "unknown")}`,
           `This chat: ${sessions.conversationActive ? "running" : sessions.conversationLoaded ? "ready" : "new"}`,
+          `Agent process: ${sessions.agentProcessAlive ? "alive" : "not running"}`,
+          `Last activity: ${sessions.lastAgentActivity ?? "none"}`,
           `Concurrent turns: ${sessions.activeTurns}`,
           `Resident sessions: ${sessions.residentSessions}/${sessions.maxConcurrent}`,
           `Pending sessions: ${sessions.pendingSessions}`,
           `Git branch: ${repository.branch}`,
           `Git: ${repository.clean ? "clean" : `${repository.changes.length} changed item(s)`}`,
           `Local commits to publish: ${repository.ahead}`,
+          "Delivery: QQ group replies expire after 5 minutes. Send Status again to retrieve a completed pending result.",
           "",
           "多个 QQ 会话会在同一个工作区并发运行。无关任务可以同时进行；编辑重叠文件时，Agent 必须先检查 Git 状态和协调声明。",
         ].join("\n"),
