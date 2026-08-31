@@ -3,6 +3,7 @@ import type { QQReplyStream } from "../qq/sender.js";
 
 const MINUTE_MS = 60_000;
 const HEARTBEAT_DELAY_MS = 2 * MINUTE_MS;
+const HEARTBEAT_INTERVAL_MS = 2 * MINUTE_MS;
 const RECENT_DELIVERY_MS = 90_000;
 const STALE_ACTIVITY_MS = 8 * MINUTE_MS;
 
@@ -46,8 +47,12 @@ export class TaskProgressReporter {
   private scheduleNext(): void {
     if (this.stopped) return;
     const elapsed = this.now() - this.startedAt;
+    const delay =
+      elapsed < HEARTBEAT_DELAY_MS
+        ? HEARTBEAT_DELAY_MS - elapsed
+        : HEARTBEAT_INTERVAL_MS;
     this.cancelTimer = this.schedule(
-      Math.max(0, HEARTBEAT_DELAY_MS - elapsed),
+      Math.max(0, delay),
       () => void this.report(),
     );
   }
@@ -63,7 +68,7 @@ export class TaskProgressReporter {
       ) {
         const status = await this.getStatus();
         if (this.stopped) return;
-        await this.reply.sendProgress(
+        const delivered = await this.reply.sendProgress(
           formatTaskProgress(
             status,
             now - this.startedAt,
@@ -72,7 +77,7 @@ export class TaskProgressReporter {
           ),
         );
         this.log(
-          `QQ task heartbeat sent elapsedMs=${now - this.startedAt} phase=${this.phase} activityAgeMs=${
+          `QQ task heartbeat ${delivered ? "sent" : "skipped"} elapsedMs=${now - this.startedAt} phase=${this.phase} activityAgeMs=${
             status.lastAgentActivityAt === undefined
               ? "unknown"
               : Math.max(0, now - status.lastAgentActivityAt)
@@ -81,6 +86,8 @@ export class TaskProgressReporter {
       }
     } catch (error) {
       this.log(`QQ task heartbeat failed: ${errorMessage(error)}`);
+    } finally {
+      this.scheduleNext();
     }
   }
 }
@@ -93,10 +100,10 @@ export function formatTaskProgress(
 ): string {
   const elapsed = formatDuration(elapsedMs);
   if (phase === "queued") {
-    return `任务仍在排队，已等待 ${elapsed}。当前有 ${status.activeTurns} 个并发任务。QQ群不允许 Bot 主动发消息；若超过 5 分钟，请发送 Status 查询状态或取回已完成结果。`;
+    return `任务仍在排队，已等待 ${elapsed}。当前有 ${status.activeTurns} 个并发任务。当前群或机器人可能无法使用主动消息；若超过 5 分钟，请发送 Status 查询状态或取回已完成结果。`;
   }
   if (phase === "starting") {
-    return `任务已等待 ${elapsed}，正在启动或恢复 Agent 会话。QQ群不允许 Bot 主动发消息；若超过 5 分钟，请发送 Status 查询状态或取回已完成结果。`;
+    return `任务已等待 ${elapsed}，正在启动或恢复 Agent 会话。当前群或机器人可能无法使用主动消息；若超过 5 分钟，请发送 Status 查询状态或取回已完成结果。`;
   }
   if (!status.agentProcessAlive) {
     return `任务已运行 ${elapsed}，但 Agent 进程已停止，结果可能无法完成。请发送 Status 检查待发送结果，或发送 Stop 后重新提交任务。`;
@@ -111,7 +118,7 @@ export function formatTaskProgress(
   const recent = activityAge === undefined
     ? ""
     : `，最近活动在 ${formatDuration(activityAge)} 前`;
-  return `任务仍在正常运行，已用时 ${elapsed}${recent}。当前状态：${activity}。QQ群超过 5 分钟后不能主动推送；请发送 Status 查询状态或取回结果。`;
+  return `任务仍在正常运行，已用时 ${elapsed}${recent}。当前状态：${activity}。群聊被动回复超过 5 分钟后失效；请发送 Status 查询状态或取回结果。`;
 }
 
 function defaultSchedule(delayMs: number, callback: () => void): () => void {

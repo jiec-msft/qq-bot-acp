@@ -367,11 +367,11 @@ export function buildStreamMessageBody(
     index: input.index,
     content_type: input.contentType,
     content_raw: input.text,
-    msg_id: input.replyToId,
+    ...(!input.isWakeup ? { msg_id: input.replyToId } : {}),
     ...(input.streamMessageId
       ? { stream_msg_id: input.streamMessageId }
       : {}),
-    msg_seq: input.sequence,
+    ...(!input.isWakeup ? { msg_seq: input.sequence } : {}),
     ...(input.isWakeup ? { is_wakeup: true } : {}),
   };
 }

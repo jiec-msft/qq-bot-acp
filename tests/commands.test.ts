@@ -51,6 +51,8 @@ test("simple panel commands map to safe control actions", () => {
   assert.deepEqual(parseControlCommand("New Chat"), { kind: "new" });
   assert.deepEqual(parseControlCommand("Stop"), { kind: "cancel" });
   assert.deepEqual(parseControlCommand("Status"), { kind: "status" });
+  assert.deepEqual(parseControlCommand("Retry"), { kind: "retry" });
+  assert.deepEqual(parseControlCommand("Seen"), { kind: "seen" });
   assert.deepEqual(parseControlCommand("Normal"), {
     kind: "mode",
     mode: "normal",

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   ArtifactKind,
   PreparedArtifact,
@@ -13,6 +13,11 @@ import type {
   QQUploadMediaInput,
 } from "./api.js";
 import { QQApiError } from "./api.js";
+import {
+  DeliveryStore,
+  type Delivery,
+  type StoredDelivery,
+} from "./delivery-store.js";
 import {
   findStreamingSplit,
   renderNativeMarkdownForQQ,
@@ -32,7 +37,9 @@ const MAX_ARTIFACTS_PER_TURN = 2;
 const STREAM_LENGTH_MARGIN = 64;
 const STREAM_UPDATE_INTERVAL_MS = 300;
 const STREAM_DIAGNOSTIC_INTERVAL_MS = 1_000;
-const PASSIVE_REPLY_SAFE_MS = 4 * 60 * 1000;
+const DIRECT_PASSIVE_REPLY_MS = 60 * 60 * 1000;
+const GROUP_PASSIVE_REPLY_MS = 5 * 60 * 1000;
+const CHANNEL_PASSIVE_REPLY_MS = 5 * 60 * 1000;
 const STREAM_EMPTY_PLACEHOLDER = "…";
 const STREAM_COMPLETION_MARKER = "\n\n🔚";
 const STREAM_RECOVERY_MARKER =
@@ -51,7 +58,7 @@ export interface QQMessageApi {
 }
 
 export interface QQReplyStream {
-  sendProgress(text: string): Promise<void>;
+  sendProgress(text: string): Promise<boolean>;
   getLastDeliveryAt(): number | undefined;
   write(text: string): Promise<void>;
   flush(): Promise<void>;
@@ -70,7 +77,8 @@ export interface QQStreamingDiagnosticOptions {
 
 export class QQSender {
   private readonly shutdown = new AbortController();
-  private readonly pendingDeliveries = new Map<string, PendingDelivery[]>();
+  private readonly deliveries: DeliveryStore;
+  private readonly deliveryChains = new Map<string, Promise<void>>();
 
   constructor(
     private readonly api: QQMessageApi,
@@ -78,9 +86,19 @@ export class QQSender {
     private readonly log: (message: string) => void = () => {},
     private readonly now: () => number = Date.now,
     private readonly retryPause?: (milliseconds: number) => Promise<void>,
-  ) {}
+    deliveryRoot?: string,
+  ) {
+    this.deliveries = new DeliveryStore(deliveryRoot, now);
+  }
 
-  createReply(message: QQInboundMessage): QQReplyStream {
+  async start(): Promise<void> {
+    await this.deliveries.start();
+  }
+
+  createReply(
+    message: QQInboundMessage,
+    rememberDeliveries = true,
+  ): QQReplyStream {
     return new BufferedQQReply(
       this.api,
       message,
@@ -89,7 +107,16 @@ export class QQSender {
       false,
       true,
       this.now,
-      (delivery) => this.deferDelivery(message.conversationId, delivery),
+      (batchId, delivery) =>
+        this.deferDelivery(message.conversationId, batchId, delivery),
+      rememberDeliveries
+        ? (batchId, delivery) =>
+            this.deliveries.rememberDelivered(
+              message.conversationId,
+              batchId,
+              delivery,
+            )
+        : async () => {},
     );
   }
 
@@ -98,69 +125,145 @@ export class QQSender {
   }
 
   async reply(message: QQInboundMessage, text: string): Promise<void> {
-    const reply = this.createReply(message);
+    const reply = this.createReply(message, false);
     await reply.write(text);
     await reply.finish();
   }
 
   async deliverPending(message: QQInboundMessage): Promise<number> {
-    const pending = this.pendingDeliveries.get(message.conversationId);
-    if (!pending?.length || message.chatType === "channel") return 0;
+    return this.withDeliveryLock(
+      message.conversationId,
+      () => this.deliverPendingNow(message),
+    );
+  }
+
+  async retryRecent(message: QQInboundMessage): Promise<number> {
+    return this.withDeliveryLock(message.conversationId, async () => {
+      if (message.chatType === "channel") return 0;
+      const recent = await this.deliveries.getRecent(message.conversationId);
+      if (recent.length === 0) return 0;
+      return this.sendStoredDeliveries(message, recent, true);
+    });
+  }
+
+  async clearRecent(conversationId: string): Promise<boolean> {
+    return this.withDeliveryLock(
+      conversationId,
+      () => this.deliveries.clearRecent(conversationId),
+    );
+  }
+
+  async deliveryStatus(
+    conversationId: string,
+  ): Promise<{ pending: number; recent: number }> {
+    return this.deliveries.status(conversationId);
+  }
+
+  private async deliverPendingNow(message: QQInboundMessage): Promise<number> {
+    if (message.chatType === "channel") return 0;
     const chatType = message.chatType;
     let delivered = 0;
     let sequence = 1;
-    while (pending.length > 0 && sequence <= pendingReplyLimit(message.chatType)) {
-      const item = pending[0]!;
-      let confirmationId: string;
-      if (item.kind === "text") {
-        confirmationId = await this.retryPendingDelivery(
-          "text",
-          () => this.api.sendText({
-            chatType,
-            targetId: message.targetId,
-            text: deliveredText(item.text, delivered === 0),
-            replyToId: message.messageId,
-            sequence,
-            markdown: item.markdown,
-          }),
-        );
-      } else {
-        const fileInfo = await this.retryPendingDelivery(
-          "media upload",
-          () => this.api.uploadMedia({
-            chatType,
-            targetId: message.targetId,
-            data: item.artifact.data,
-            fileType: qqMediaFileType(item.artifact.kind),
-            fileName: item.artifact.fileName,
-          }),
-        );
-        confirmationId = await this.retryPendingDelivery(
-          "media send",
-          () => this.api.sendMedia({
-            chatType,
-            targetId: message.targetId,
-            fileInfo,
-            replyToId: message.messageId,
-            sequence,
-            caption: deliveredCaption(item, delivered === 0),
-          }),
-        );
-      }
-      this.log(
-        `QQ deferred item confirmed conversation=${conversationLogId(message.conversationId)} kind=${item.kind} sequence=${sequence} confirmation=${confirmationLogId(confirmationId)}`,
+    while (sequence <= pendingReplyLimit(message.chatType)) {
+      const envelope = await this.deliveries.peekPending(message.conversationId);
+      if (!envelope) break;
+      const confirmationId = await this.sendStoredDelivery(
+        message,
+        envelope.delivery,
+        sequence,
+        delivered === 0,
+        false,
       );
-      pending.shift();
+      this.log(
+        `QQ deferred item confirmed conversation=${conversationLogId(message.conversationId)} kind=${envelope.delivery.kind} sequence=${sequence} confirmation=${confirmationLogId(confirmationId)}`,
+      );
+      await this.deliveries.confirmPending(message.conversationId);
       delivered++;
       sequence++;
     }
-    if (pending.length === 0) {
-      this.pendingDeliveries.delete(message.conversationId);
-    }
+    const remaining = (await this.deliveries.status(message.conversationId)).pending;
     this.log(
-      `QQ deferred delivery resumed conversation=${conversationLogId(message.conversationId)} delivered=${delivered} remaining=${pending.length}`,
+      `QQ deferred delivery resumed conversation=${conversationLogId(message.conversationId)} delivered=${delivered} remaining=${remaining}`,
     );
     return delivered;
+  }
+
+  private async sendStoredDeliveries(
+    message: QQInboundMessage,
+    deliveries: StoredDelivery[],
+    retry: boolean,
+  ): Promise<number> {
+    let delivered = 0;
+    for (
+      let sequence = 1;
+      sequence <= pendingReplyLimit(message.chatType) &&
+      delivered < deliveries.length;
+      sequence++
+    ) {
+      const item = deliveries[delivered]!;
+      const confirmationId = await this.sendStoredDelivery(
+        message,
+        item,
+        sequence,
+        delivered === 0,
+        retry,
+      );
+      this.log(
+        `QQ recent item confirmed conversation=${conversationLogId(message.conversationId)} kind=${item.kind} sequence=${sequence} confirmation=${confirmationLogId(confirmationId)}`,
+      );
+      delivered++;
+    }
+    return delivered;
+  }
+
+  private async sendStoredDelivery(
+    message: QQInboundMessage,
+    item: StoredDelivery,
+    sequence: number,
+    first: boolean,
+    retry: boolean,
+  ): Promise<string> {
+    const chatType = message.chatType;
+    if (chatType === "channel") {
+      throw new Error("QQ deferred delivery is not supported in channel chats");
+    }
+    if (item.kind === "text") {
+      return this.retryPendingDelivery(
+        "text",
+        () => this.api.sendText({
+          chatType,
+          targetId: message.targetId,
+          text: deliveredText(item.text, first, retry),
+          replyToId: message.messageId,
+          sequence,
+          markdown: item.markdown,
+        }),
+        true,
+      );
+    }
+    const data = await this.deliveries.artifactData(item);
+    const fileInfo = await this.retryPendingDelivery(
+      "media upload",
+      () => this.api.uploadMedia({
+        chatType,
+        targetId: message.targetId,
+        data,
+        fileType: qqMediaFileType(item.artifact.kind),
+        fileName: item.artifact.fileName,
+      }),
+    );
+    return this.retryPendingDelivery(
+      "media send",
+      () => this.api.sendMedia({
+        chatType,
+        targetId: message.targetId,
+        fileInfo,
+        replyToId: message.messageId,
+        sequence,
+        caption: deliveredCaption(item, first, retry),
+      }),
+      true,
+    );
   }
 
   async runStreamingDiagnostic(
@@ -182,7 +285,8 @@ export class QQSender {
       options.isWakeup === true,
       false,
       this.now,
-      () => {},
+      async () => {},
+      async () => {},
     );
     const pause = options.pause;
     if (options.delayMinutes !== undefined) {
@@ -232,27 +336,61 @@ export class QQSender {
     }
   }
 
-  private deferDelivery(
+  private async deferDelivery(
     conversationId: string,
-    delivery: PendingDelivery,
-  ): void {
-    const pending = this.pendingDeliveries.get(conversationId) ?? [];
-    pending.push(delivery);
-    this.pendingDeliveries.set(conversationId, pending);
+    batchId: string,
+    delivery: Delivery,
+  ): Promise<void> {
+    await this.deliveries.append(conversationId, batchId, delivery);
+    const pending = (await this.deliveries.status(conversationId)).pending;
     this.log(
-      `QQ delivery deferred conversation=${conversationLogId(conversationId)} kind=${delivery.kind} pending=${pending.length}`,
+      `QQ delivery deferred conversation=${conversationLogId(conversationId)} kind=${delivery.kind} pending=${pending}`,
     );
   }
 
-  private async retryPendingDelivery<T>(
-    operation: string,
-    send: () => Promise<T>,
+  private async withDeliveryLock<T>(
+    conversationId: string,
+    operation: () => Promise<T>,
   ): Promise<T> {
+    const previous = this.deliveryChains.get(conversationId) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const queued = previous.then(() => current);
+    this.deliveryChains.set(conversationId, queued);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.deliveryChains.get(conversationId) === queued) {
+        this.deliveryChains.delete(conversationId);
+      }
+    }
+  }
+
+  private async retryPendingDelivery(
+    operation: string,
+    send: () => Promise<string>,
+    acceptDuplicate = false,
+  ): Promise<string> {
     const delays = [500, 1_500];
     for (let attempt = 0; ; attempt++) {
       try {
         return await send();
       } catch (error) {
+        if (
+          attempt > 0 &&
+          acceptDuplicate &&
+          error instanceof QQApiError &&
+          String(error.code) === "40054005"
+        ) {
+          this.log(
+            `QQ deferred ${operation} duplicate confirmed after an uncertain retry`,
+          );
+          return "duplicate-accepted";
+        }
         if (attempt >= delays.length || !isRetriableDeliveryError(error)) {
           throw error;
         }
@@ -268,10 +406,6 @@ export class QQSender {
     }
   }
 }
-
-type PendingDelivery =
-  | { kind: "text"; text: string; markdown: boolean }
-  | { kind: "artifact"; artifact: PreparedArtifact; caption?: string };
 
 class BufferedQQReply implements QQReplyStream {
   private buffer = "";
@@ -292,6 +426,7 @@ class BufferedQQReply implements QQReplyStream {
   private streamRecovered = false;
   private readonly streamTrace = nextStreamTrace++;
   private readonly createdAt: number;
+  private readonly deliveryBatchId = randomUUID();
   private lastDeliveryAt?: number;
 
   constructor(
@@ -302,7 +437,14 @@ class BufferedQQReply implements QQReplyStream {
     private readonly forceWakeup = false,
     private readonly allowRecovery = true,
     private readonly now: () => number = Date.now,
-    private readonly deferDelivery: (delivery: PendingDelivery) => void,
+    private readonly deferDelivery: (
+      batchId: string,
+      delivery: Delivery,
+    ) => Promise<void>,
+    private readonly rememberDelivered: (
+      batchId: string,
+      delivery: Delivery,
+    ) => Promise<void>,
   ) {
     this.createdAt = now();
   }
@@ -311,7 +453,7 @@ class BufferedQQReply implements QQReplyStream {
     return this.enqueue(() => this.writeNow(text));
   }
 
-  sendProgress(text: string): Promise<void> {
+  sendProgress(text: string): Promise<boolean> {
     return this.enqueue(() => this.sendProgressNow(text));
   }
 
@@ -347,14 +489,18 @@ class BufferedQQReply implements QQReplyStream {
     await this.flushProgressive();
   }
 
-  private async sendProgressNow(text: string): Promise<void> {
+  private async sendProgressNow(text: string): Promise<boolean> {
     if (this.finished) throw new Error("Cannot write to a finished QQ reply");
     const rendered = this.render(text);
-    if (!rendered) return;
+    if (!rendered) return false;
     const passive = this.passiveReplyAvailable();
     if (!passive) {
       this.log("QQ progress update skipped because the passive reply window expired");
-      return;
+      return false;
+    }
+    if (this.availableReplySlots() <= FINAL_REPLY_RESERVE) {
+      this.log("QQ progress update skipped to reserve the final reply slot");
+      return false;
     }
     await this.api.sendText({
       chatType: this.message.chatType,
@@ -365,6 +511,7 @@ class BufferedQQReply implements QQReplyStream {
       markdown: this.effectiveMarkdownMode() === "native",
     });
     this.markDelivered();
+    return true;
   }
 
   private async flushNow(): Promise<void> {
@@ -401,7 +548,7 @@ class BufferedQQReply implements QQReplyStream {
       throw new Error("No QQ reply slot remains for another artifact");
     }
     if (!this.passiveReplyAvailable()) {
-      this.defer({
+      await this.defer({
         kind: "artifact",
         artifact,
         caption: caption ? renderMarkdownForQQ(caption) : undefined,
@@ -424,6 +571,11 @@ class BufferedQQReply implements QQReplyStream {
       fileInfo,
       replyToId: this.message.messageId,
       sequence: this.allocateSequence(),
+      caption: caption ? renderMarkdownForQQ(caption) : undefined,
+    });
+    await this.rememberDelivered(this.deliveryBatchId, {
+      kind: "artifact",
+      artifact,
       caption: caption ? renderMarkdownForQQ(caption) : undefined,
     });
     this.markDelivered();
@@ -526,6 +678,11 @@ class BufferedQQReply implements QQReplyStream {
     }
     this.assertStreamPrefix(desired);
     await this.sendStreamFrame(`${desired}${STREAM_COMPLETION_MARKER}`, 10);
+    await this.rememberDelivered(this.deliveryBatchId, {
+      kind: "text",
+      text: desired,
+      markdown: this.effectiveMarkdownMode() === "native",
+    });
   }
 
   private renderStreamText(final = false): string {
@@ -667,7 +824,7 @@ class BufferedQQReply implements QQReplyStream {
   private async sendChunks(chunks: string[]): Promise<void> {
     for (const text of chunks) {
       if (!this.passiveReplyAvailable()) {
-        this.defer({
+        await this.defer({
           kind: "text",
           text,
           markdown: this.effectiveMarkdownMode() === "native",
@@ -680,6 +837,11 @@ class BufferedQQReply implements QQReplyStream {
         text,
         replyToId: this.message.messageId,
         sequence: this.allocateSequence(),
+        markdown: this.effectiveMarkdownMode() === "native",
+      });
+      await this.rememberDelivered(this.deliveryBatchId, {
+        kind: "text",
+        text,
         markdown: this.effectiveMarkdownMode() === "native",
       });
       this.markDelivered();
@@ -706,7 +868,8 @@ class BufferedQQReply implements QQReplyStream {
   }
 
   private passiveReplyAvailable(): boolean {
-    return this.now() - this.createdAt < PASSIVE_REPLY_SAFE_MS;
+    return this.now() - this.createdAt <
+      passiveReplyWindowMs(this.message.chatType);
   }
 
   private availableReplySlots(): number {
@@ -719,7 +882,11 @@ class BufferedQQReply implements QQReplyStream {
     return (
       this.forceWakeup ||
       this.streamRecovered ||
-      this.now() - this.createdAt >= PASSIVE_REPLY_SAFE_MS
+      (
+        this.streamMessageId === undefined &&
+        this.now() - this.createdAt >=
+          passiveReplyWindowMs(this.message.chatType)
+      )
     );
   }
 
@@ -727,8 +894,8 @@ class BufferedQQReply implements QQReplyStream {
     this.lastDeliveryAt = this.now();
   }
 
-  private defer(delivery: PendingDelivery): void {
-    this.deferDelivery(delivery);
+  private async defer(delivery: Delivery): Promise<void> {
+    await this.deferDelivery(this.deliveryBatchId, delivery);
     this.deferredDeliveries++;
   }
 }
@@ -765,18 +932,32 @@ function confirmationLogId(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 8);
 }
 
-function deliveredText(text: string, first: boolean): string {
+function deliveredText(text: string, first: boolean, retry = false): string {
   return first
-    ? `检测到上次任务已有待发送结果，正在补发。\n\n${text}`
+    ? `${retry ? "正在重新发送最近一次结果。" : "检测到上次任务已有待发送结果，正在补发。"}\n\n${text}`
     : text;
 }
 
 function deliveredCaption(
-  item: Extract<PendingDelivery, { kind: "artifact" }>,
+  item: Extract<StoredDelivery, { kind: "artifact" }>,
   first: boolean,
+  retry = false,
 ): string | undefined {
   if (!first) return item.caption;
-  return `补发结果：${item.caption ?? item.artifact.fileName}`;
+  return `${retry ? "重新发送" : "补发结果"}：${item.caption ?? item.artifact.fileName}`;
+}
+
+function passiveReplyWindowMs(
+  chatType: QQInboundMessage["chatType"],
+): number {
+  switch (chatType) {
+    case "direct":
+      return DIRECT_PASSIVE_REPLY_MS;
+    case "group":
+      return GROUP_PASSIVE_REPLY_MS;
+    case "channel":
+      return CHANNEL_PASSIVE_REPLY_MS;
+  }
 }
 
 function isRetriableDeliveryError(error: unknown): boolean {

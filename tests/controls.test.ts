@@ -46,6 +46,8 @@ test("QQ controls create simple English menu and panels", async () => {
       "New Chat",
       "Stop",
       "Status",
+      "Retry",
+      "Seen",
       "Normal",
       "Deep",
       "Learn",
