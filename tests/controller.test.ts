@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { shouldHandleMessage } from "../src/bot/controller.js";
+import { inboundMessageDisposition } from "../src/bot/controller.js";
 import type { QQInboundMessage } from "../src/qq/types.js";
 
-test("ordinary full-mode group messages never enter Bot behavior", () => {
+test("full-mode group messages distinguish real and literal mentions", () => {
   const message: QQInboundMessage = {
     accountId: "app",
     conversationId: "conversation",
@@ -17,7 +17,25 @@ test("ordinary full-mode group messages never enter Bot behavior", () => {
     addressed: false,
   };
 
-  assert.equal(shouldHandleMessage(message), false);
-  assert.equal(shouldHandleMessage({ ...message, addressed: true }), true);
-  assert.equal(shouldHandleMessage({ ...message, addressed: undefined }), true);
+  assert.equal(inboundMessageDisposition(message), "ignore");
+  assert.equal(
+    inboundMessageDisposition({ ...message, text: "  @Copilot help me" }),
+    "warn-literal-mention",
+  );
+  assert.equal(
+    inboundMessageDisposition({ ...message, text: "@Copilot帮我做题" }),
+    "warn-literal-mention",
+  );
+  assert.equal(
+    inboundMessageDisposition({ ...message, text: "Discuss @Copilot later" }),
+    "ignore",
+  );
+  assert.equal(
+    inboundMessageDisposition({ ...message, addressed: true }),
+    "handle",
+  );
+  assert.equal(
+    inboundMessageDisposition({ ...message, addressed: undefined }),
+    "handle",
+  );
 });
