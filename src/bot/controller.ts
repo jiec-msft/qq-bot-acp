@@ -116,6 +116,24 @@ export class BotController {
       await this.handleStatus(message);
       return;
     }
+    if (command?.kind === "retry") {
+      const delivered = await this.sender.retryRecent(message);
+      if (delivered === 0) {
+        await this.sender.reply(
+          message,
+          "最近 30 分钟没有可重新发送的结果。",
+        );
+      }
+      return;
+    }
+    if (command?.kind === "seen") {
+      const cleared = await this.sender.clearRecent(message.conversationId);
+      await this.sender.reply(
+        message,
+        cleared ? "已确认收到，并清除最近交付记录。" : "没有需要清除的最近交付记录。",
+      );
+      return;
+    }
     if (command?.kind === "mode") {
       await this.handleMode(message, command.mode);
       return;
@@ -178,7 +196,9 @@ export class BotController {
     this.log(`QQ task started conversation=${taskId}`);
     try {
       await reply.sendProgress(
-        "任务已接收，正在处理或排队。QQ群不允许 Bot 主动发消息；若任务超过 5 分钟，请发送 Status 查询状态或取回已完成结果。发送 Stop 可取消。",
+        message.chatType === "group"
+          ? "任务已接收，正在处理或排队。当前群或机器人可能无法使用主动消息；若任务超过 5 分钟，请发送 Status 查询状态或取回已完成结果。发送 Stop 可取消。"
+          : "任务已接收，正在处理或排队。单聊被动回复有效期为 60 分钟；发送 Status 可查询状态，Stop 可取消。",
       );
     } catch (error) {
       this.log(`QQ task acknowledgement failed: ${errorMessage(error)}`);
@@ -228,9 +248,10 @@ export class BotController {
 
   private async handleStatus(message: QQInboundMessage): Promise<void> {
     try {
-      const [sessions, repository] = await Promise.all([
+      const [sessions, repository, delivery] = await Promise.all([
         this.sessions.getRuntimeStatus(message.conversationId),
         this.repository.status(),
+        this.sender.deliveryStatus(message.conversationId),
       ]);
       const mode = sessions.options.reasoning_effort ?? "unknown";
       await this.sender.reply(
@@ -247,7 +268,10 @@ export class BotController {
           `Git branch: ${repository.branch}`,
           `Git: ${repository.clean ? "clean" : `${repository.changes.length} changed item(s)`}`,
           `Local commits to publish: ${repository.ahead}`,
-          "Delivery: QQ group replies expire after 5 minutes. Send Status again to retrieve a completed pending result.",
+          `Delivery: ${delivery.pending} pending item(s), ${delivery.recent} recent confirmed item(s).`,
+          message.chatType === "direct"
+            ? "QQ direct passive replies expire after 60 minutes. Retry resends the latest result; Seen clears it."
+            : "QQ group replies expire after 5 minutes. Status retrieves pending results; Retry resends the latest result.",
           "",
           "多个 QQ 会话会在同一个工作区并发运行。无关任务可以同时进行；编辑重叠文件时，Agent 必须先检查 Git 状态和协调声明。",
         ].join("\n"),
@@ -588,6 +612,8 @@ function helpText(): string {
     "New Chat - 创建新会话并加载最新知识",
     "Stop - 停止当前任务",
     "Status - 查看并发会话、模式和 Git 状态",
+    "Retry - 重新发送最近 30 分钟内的结果",
+    "Seen - 确认收到并清除最近交付记录",
     "Normal - GPT-5.6 Sol + medium",
     "Deep - GPT-5.6 Sol + max",
     "Learn - 分析反馈或附件，只生成学习提案",

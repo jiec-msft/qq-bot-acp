@@ -2,6 +2,8 @@ export type ControlCommand =
   | { kind: "id" }
   | { kind: "help" }
   | { kind: "status" }
+  | { kind: "retry" }
+  | { kind: "seen" }
   | { kind: "mode"; mode: "normal" | "deep" }
   | { kind: "learn"; guidance?: string }
   | { kind: "approve" }
@@ -26,6 +28,8 @@ export function parseControlCommand(text: string): ControlCommand | null {
   if (normalized === "/id") return { kind: "id" };
   if (["help", "/help"].includes(normalized)) return { kind: "help" };
   if (["status", "/status"].includes(normalized)) return { kind: "status" };
+  if (["retry", "/retry"].includes(normalized)) return { kind: "retry" };
+  if (["seen", "/seen"].includes(normalized)) return { kind: "seen" };
   if (["normal", "/normal"].includes(normalized)) {
     return { kind: "mode", mode: "normal" };
   }

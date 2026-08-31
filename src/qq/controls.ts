@@ -12,6 +12,8 @@ const PANEL_ITEMS: QQPanelItem[] = [
   command("New Chat", "Start a new session"),
   command("Stop", "Cancel current task"),
   command("Status", "Show sessions and Git"),
+  command("Retry", "Resend latest result"),
+  command("Seen", "Clear latest result"),
   command("Normal", "Use medium reasoning"),
   command("Deep", "Use max reasoning"),
   command("Learn", "Propose new knowledge"),

@@ -137,12 +137,13 @@ processes so each conversation starts against the new agent.
 
 Direct-chat responses use QQ's official
 [`/v2/users/{openid}/stream_messages`](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_openid_stream_messages.post.html)
-API. Each inbound QQ message owns one independent response stream: every
-update retains that message's original `msg_id` and `msg_seq`, then reuses the
-`stream_msg_id` returned by QQ's first frame. ACP deltas are accumulated and
-sent as throttled full-document `replace` updates, and the final update sets
-`input_state: 10` with a single `🔚` marker in the same message. Fenced
-code and explicit LaTeX that span ACP deltas are held until structurally
+API. Each inbound QQ message owns one independent response stream. Passive
+updates retain that message's original `msg_id` and `msg_seq`, then reuse the
+`stream_msg_id` returned by QQ's first frame. A wakeup stream instead sends
+`is_wakeup=true` without the mutually exclusive `msg_id` fields. ACP deltas are
+accumulated and sent as throttled full-document `replace` updates, and the final
+update sets `input_state: 10` with a single `🔚` marker in the same message.
+Fenced code and explicit LaTeX that span ACP deltas are held until structurally
 complete so an update never rewrites a prefix QQ may already have displayed.
 
 QQ currently exposes `stream_messages` for direct/C2C chats only. Group chats
@@ -152,7 +153,21 @@ batching: fenced code blocks, top-level list items, and nested list content
 remain on valid boundaries. QQ permits four passive replies per inbound direct
 message and five per inbound group message. Text streams/messages and explicit
 artifacts share that per-message sequence budget without rebinding a response
-to a newer inbound message.
+to a newer inbound message. Direct passive replies remain valid for 60 minutes;
+group and channel replies remain valid for 5 minutes.
+
+Results that outlive their passive-reply window are persisted under the bot
+instance's `deliveries` directory. Text metadata is stored in an atomic state
+file, while artifacts are stored as separate binary files and uploaded again
+when delivery resumes. A restart therefore does not lose completed work.
+The next inbound message delivers pending results before handling a new task.
+QQ message IDs confirm platform acceptance; transient failures retry with the
+same `msg_id + msg_seq`, and a duplicate response after an uncertain retry is
+treated as evidence that the first request was accepted.
+
+The latest confirmed result remains available for 30 minutes. `Retry` resends
+it with the new inbound message ID and fresh media upload data; `Seen` clears
+it. This is a delivery fallback, not a user-read receipt.
 
 The bridge does not split a direct stream at the legacy 2,000-character chunk
 size. QQ's `remain_msg_len` reports characters still pending for server-side
@@ -259,6 +274,8 @@ Help
 New Chat
 Stop
 Status
+Retry
+Seen
 Normal
 Deep
 Learn
@@ -311,11 +328,11 @@ after a controlled 1, 3, 5, or 10 minute idle period. Add `wakeup` to set QQ's
 `is_wakeup=true` flag for an A/B comparison.
 
 When an established stream fails with QQ code `40034020`, the bridge makes one
-recovery attempt using a new stream, a new passive-reply sequence, and
-`is_wakeup=true`. The replacement stream is visibly labelled and includes the
-complete answer because QQ may have already displayed part of the expired
-stream. Other errors and a failed recovery still surface normally; recovery
-never loops.
+recovery attempt using a new stream and `is_wakeup=true`. The wakeup request
+does not include `msg_id` or `msg_seq`. The replacement stream is visibly
+labelled and includes the complete answer because QQ may have already displayed
+part of the expired stream. Other errors and a failed recovery still surface
+normally; recovery never loops.
 
 Service logs record only the per-turn trace, frame index/state, cumulative and
 delta character counts, UTF-8 byte count, idle time, total stream age, content

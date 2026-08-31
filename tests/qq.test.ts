@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import os from "node:os";
+import path from "node:path";
+import fs from "node:fs/promises";
 import test from "node:test";
 import { createInitialConfig, type BotConfig } from "../src/config/schema.js";
 import {
@@ -517,7 +520,7 @@ test("expired group heartbeats are skipped instead of sent actively", async () =
   assert.equal(reply.getLastDeliveryAt(), 0);
 });
 
-test("expired direct heartbeats are skipped instead of sent actively", async () => {
+test("direct passive replies remain available for the official 60 minute window", async () => {
   let now = 0;
   const { sender, sent } = senderFixture({}, undefined, () => now);
   const reply = sender.createReply(inboundMessage());
@@ -525,13 +528,32 @@ test("expired direct heartbeats are skipped instead of sent actively", async () 
   await reply.sendProgress("Task accepted");
   now = 5 * 60 * 1000;
   await reply.sendProgress("Still running");
+  now = 60 * 60 * 1000;
+  await reply.sendProgress("Expired");
 
-  assert.equal(sent.length, 1);
+  assert.equal(sent.length, 2);
   assert.equal(sent[0]?.replyToId, "inbound");
   assert.equal(sent[0]?.sequence, 1);
+  assert.equal(sent[1]?.sequence, 2);
 });
 
-test("long-running direct streams start with wakeup enabled", async () => {
+test("progress updates reserve one direct reply slot for the final result", async () => {
+  const { sender, sent } = senderFixture({ streamResponses: false });
+  const reply = sender.createReply(inboundMessage());
+
+  assert.equal(await reply.sendProgress("Task accepted"), true);
+  assert.equal(await reply.sendProgress("Still running 1"), true);
+  assert.equal(await reply.sendProgress("Still running 2"), true);
+  assert.equal(await reply.sendProgress("Still running 3"), false);
+  await reply.write("Task complete");
+  await reply.finish();
+
+  assert.equal(sent.length, 4);
+  assert.equal(sent.at(-1)?.text, "Task complete");
+  assert.equal(sent.at(-1)?.sequence, 4);
+});
+
+test("direct streams stay passive until the official 60 minute window expires", async () => {
   let now = 0;
   const { sender, streams } = senderFixture({}, undefined, () => now);
   const reply = sender.createReply(inboundMessage());
@@ -542,7 +564,7 @@ test("long-running direct streams start with wakeup enabled", async () => {
   await reply.finish();
 
   assert.ok(streams.length >= 2);
-  assert.ok(streams.every(({ isWakeup }) => isWakeup === true));
+  assert.ok(streams.every(({ isWakeup }) => isWakeup === false));
   assert.ok(streams.every(({ sequence }) => sequence === 2));
 });
 
@@ -681,9 +703,7 @@ test("QQ stream request bodies and responses follow the official contract", () =
       index: 1,
       content_type: "markdown",
       content_raw: "# Answer\n\nDone",
-      msg_id: "inbound",
       stream_msg_id: "stream-1",
-      msg_seq: 2,
       is_wakeup: true,
     },
   );
@@ -1144,7 +1164,10 @@ test("ordinary artifacts preserve their file name and use QQ file uploads", asyn
   const { sender, uploads, media } = senderFixture({ streamResponses: false });
   const reply = sender.createReply(inboundMessage());
 
-  await reply.sendArtifact(artifact("document", "report.pdf"), "Final report");
+  await reply.sendArtifact(
+    artifact("d".repeat(64), "report.pdf"),
+    "Final report",
+  );
   await reply.finish();
 
   assert.equal(uploads.length, 1);
@@ -1223,6 +1246,50 @@ test("deferred delivery retries transient failures with a stable sequence", asyn
   assert.ok(logs.every((entry) => !entry.includes("confirmed-message")));
 });
 
+test("a duplicate response after an uncertain retry is treated as accepted", async () => {
+  const config = createInitialConfig({
+    appId: "app",
+    clientSecretFile: "/unused",
+    agentCommand: "agent",
+  });
+  let now = 0;
+  let attempts = 0;
+  const logs: string[] = [];
+  const sender = new QQSender(
+    {
+      sendText: async (input) => {
+        if (input.replyToId === "inbound") return "ack";
+        attempts++;
+        if (attempts === 1) throw new TypeError("response lost");
+        throw new QQApiError("send", 400, 40054005);
+      },
+      sendStream: async () => ({ id: "stream" }),
+      uploadMedia: async () => "file",
+      sendMedia: async () => "media",
+    },
+    () => config,
+    (message) => logs.push(message),
+    () => now,
+    async () => {},
+  );
+  const reply = sender.createReply(inboundMessage("group"));
+  await reply.sendProgress("Task accepted");
+  now = 5 * 60 * 1000;
+  await reply.write("Task complete");
+  await reply.finish();
+
+  assert.equal(
+    await sender.deliverPending(inboundMessage("group", "fresh")),
+    1,
+  );
+  assert.equal(attempts, 2);
+  assert.ok(logs.some((entry) => entry.includes("duplicate confirmed")));
+  assert.equal(
+    (await sender.deliveryStatus("conversation")).pending,
+    0,
+  );
+});
+
 test("long-running group artifacts resume on the next inbound message", async () => {
   let now = 0;
   const { sender, media } = senderFixture(
@@ -1234,7 +1301,10 @@ test("long-running group artifacts resume on the next inbound message", async ()
 
   await reply.sendProgress("Task accepted");
   now = 5 * 60 * 1000;
-  await reply.sendArtifact(artifact("document", "report.pdf"), "Final report");
+  await reply.sendArtifact(
+    artifact("d".repeat(64), "report.pdf"),
+    "Final report",
+  );
   await reply.finish();
 
   assert.equal(media.length, 0);
@@ -1245,6 +1315,159 @@ test("long-running group artifacts resume on the next inbound message", async ()
   assert.equal(media[0]?.replyToId, "fresh");
   assert.equal(media[0]?.sequence, 1);
   assert.equal(media[0]?.caption, "补发结果：Final report");
+});
+
+test("deferred deliveries survive a sender restart", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "qq-delivery-"));
+  try {
+    let now = 0;
+    const first = senderFixture(
+      { streamResponses: false },
+      undefined,
+      () => now,
+      root,
+    );
+    await first.sender.start();
+    const reply = first.sender.createReply(inboundMessage("group"));
+    await reply.sendProgress("Task accepted");
+    now = 5 * 60 * 1000;
+    await reply.sendArtifact(
+      artifact("d".repeat(64), "report.pdf"),
+      "Final report",
+    );
+    await reply.write("Task complete");
+    await reply.finish();
+
+    const second = senderFixture(
+      { streamResponses: false },
+      undefined,
+      () => now,
+      root,
+    );
+    await second.sender.start();
+    assert.equal(
+      await second.sender.deliverPending(inboundMessage("group", "fresh")),
+      2,
+    );
+    assert.equal(second.media[0]?.caption, "补发结果：Final report");
+    assert.match(second.sent[0]!.text, /Task complete/);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("recent confirmed deliveries support Retry and Seen", async () => {
+  let now = 0;
+  const { sender, sent } = senderFixture(
+    { streamResponses: false },
+    undefined,
+    () => now,
+  );
+  const reply = sender.createReply(inboundMessage("group"));
+  await reply.sendProgress("Task accepted");
+  now = 5 * 60 * 1000;
+  await reply.write("Task complete");
+  await reply.finish();
+
+  await sender.deliverPending(inboundMessage("group", "fresh"));
+  assert.equal(
+    await sender.retryRecent(inboundMessage("group", "retry")),
+    1,
+  );
+  assert.match(sent.at(-1)!.text, /Task complete/);
+  assert.equal(await sender.clearRecent("conversation"), true);
+  assert.equal(
+    await sender.retryRecent(inboundMessage("group", "retry-2")),
+    0,
+  );
+});
+
+test("control replies do not replace the task result retained for Retry", async () => {
+  const { sender, sent } = senderFixture({ streamResponses: false });
+  const task = sender.createReply(inboundMessage("group"));
+  await task.write("Task result");
+  await task.finish();
+  await sender.reply(
+    inboundMessage("group", "status"),
+    "Status: ready",
+  );
+
+  assert.equal(
+    await sender.retryRecent(inboundMessage("group", "retry")),
+    1,
+  );
+  assert.match(sent.at(-1)!.text, /Task result/);
+  assert.doesNotMatch(sent.at(-1)!.text, /Status: ready/);
+});
+
+test("Seen waits for an in-flight Retry in the same conversation", async () => {
+  const config = createInitialConfig({
+    appId: "app",
+    clientSecretFile: "/unused",
+    agentCommand: "agent",
+  });
+  let releaseRetry!: () => void;
+  const retryBlocked = new Promise<void>((resolve) => {
+    releaseRetry = resolve;
+  });
+  const sender = new QQSender(
+    {
+      sendText: async (input) => {
+        if (input.replyToId === "retry") await retryBlocked;
+        return "confirmed";
+      },
+      sendStream: async () => ({ id: "stream" }),
+      uploadMedia: async () => "file",
+      sendMedia: async () => "media",
+    },
+    () => config,
+  );
+  const task = sender.createReply(inboundMessage("group"));
+  await task.write("Task result");
+  await task.finish();
+
+  const retry = sender.retryRecent(inboundMessage("group", "retry"));
+  let cleared = false;
+  const seen = sender.clearRecent("conversation").then((result) => {
+    cleared = result;
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(cleared, false);
+  releaseRetry();
+  await Promise.all([retry, seen]);
+  assert.equal(cleared, true);
+});
+
+test("replacing a recent artifact batch removes the old persisted file", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "qq-delivery-gc-"));
+  try {
+    const { sender } = senderFixture(
+      { streamResponses: false },
+      undefined,
+      undefined,
+      root,
+    );
+    await sender.start();
+    const first = sender.createReply(inboundMessage("group", "first"));
+    await first.sendArtifact(
+      artifact("a".repeat(64), "first.pdf"),
+      "First",
+    );
+    await first.finish();
+    const second = sender.createReply(inboundMessage("group", "second"));
+    await second.sendArtifact(
+      artifact("b".repeat(64), "second.pdf"),
+      "Second",
+    );
+    await second.finish();
+
+    assert.deepEqual(
+      await fs.readdir(path.join(root, "artifacts")),
+      [`${"b".repeat(64)}.bin`],
+    );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 test("deferred artifacts and final text fit one fresh reply window", async () => {
@@ -1335,6 +1558,7 @@ function senderFixture(
     input: QQSendStreamInput,
   ) => Promise<{ id: string; pendingCharacters?: number }>,
   now?: () => number,
+  deliveryRoot?: string,
 ) {
   const config = createInitialConfig({
     appId: "app",
@@ -1379,6 +1603,8 @@ function senderFixture(
     () => config,
     (message) => logs.push(message),
     now,
+    undefined,
+    deliveryRoot,
   );
   return { sender, sent, streams, uploads, media, operations, logs };
 }

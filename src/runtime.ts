@@ -34,7 +34,14 @@ export class BotRuntime {
       log,
     );
     let controller!: BotController;
-    const sender = new QQSender(api, () => controller.getConfig(), log);
+    const sender = new QQSender(
+      api,
+      () => controller.getConfig(),
+      log,
+      Date.now,
+      undefined,
+      store.paths.deliveries,
+    );
     this.sender = sender;
     const controls = new QQControls(api);
     this.stager = new AttachmentStager(config.agent.cwd, log);
@@ -85,6 +92,7 @@ export class BotRuntime {
   }
 
   async start(): Promise<void> {
+    await this.sender.start();
     await this.stager.start();
     this.sessions.start();
     try {

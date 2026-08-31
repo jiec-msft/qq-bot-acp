@@ -12,6 +12,7 @@ export interface BotPaths {
   sessions: string;
   logs: string;
   media: string;
+  deliveries: string;
 }
 
 export function resolveBotPaths(instance?: string, home = os.homedir()): BotPaths {
@@ -32,5 +33,6 @@ export function resolveBotPaths(instance?: string, home = os.homedir()): BotPath
     sessions: path.join(root, "sessions.json"),
     logs: path.join(root, "logs"),
     media: path.join(root, "media"),
+    deliveries: path.join(root, "deliveries"),
   };
 }

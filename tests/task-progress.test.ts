@@ -14,6 +14,7 @@ test("task progress continues when Agent output has not reached QQ", async () =>
       getLastDeliveryAt: () => 0,
       sendProgress: async (text: string) => {
         sent.push(text);
+        return true;
       },
     },
     async () => runtimeStatus({
@@ -38,6 +39,11 @@ test("task progress continues when Agent output has not reached QQ", async () =>
   assert.equal(sent.length, 1);
   assert.match(sent[0]!, /正常运行/);
   assert.match(sent[0]!, /正在编辑文件/);
+
+  now = 4 * 60_000;
+  scheduled?.();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(sent.length, 2);
   reporter.stop();
 });
 
