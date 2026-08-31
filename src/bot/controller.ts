@@ -169,26 +169,53 @@ export class BotController {
     const reply = this.sender.createReply(message);
     let thoughtStarted = false;
     let answerStarted = false;
-    await this.sessions.prompt(message.conversationId, prompt, {
-      onText: async (text) => {
-        if (thoughtStarted && !answerStarted) {
-          answerStarted = true;
-          await reply.write("\n\n## Answer\n\n");
-        }
-        await reply.write(text);
-      },
-      onThought: async (text) => {
-        if (!thoughtStarted) {
-          thoughtStarted = true;
-          await reply.write("## Thought\n\n");
-        }
-        await reply.write(text);
-      },
-      onArtifact: (artifact, caption) =>
-        reply.sendArtifact(artifact, caption),
-      onComplete: () => reply.finish(),
-      policy,
-    });
+    let agentOutputStarted = false;
+    try {
+      await reply.sendProgress(
+        "任务已接收，正在处理或排队。复杂文档和 PPT 可能需要较长时间；发送 Stop 可取消。",
+      );
+    } catch (error) {
+      this.log(`QQ task acknowledgement failed: ${errorMessage(error)}`);
+    }
+    const progressTimer = message.chatType === "direct"
+      ? undefined
+      : setTimeout(() => {
+          if (agentOutputStarted) return;
+          void reply.sendProgress(
+            "任务仍在处理或排队。完成后会主动发送结果；发送 Status 可查看状态，发送 Stop 可取消。",
+          ).catch((error) => {
+            this.log(`QQ task progress update failed: ${errorMessage(error)}`);
+          });
+        }, 2 * 60 * 1000);
+    progressTimer?.unref();
+    try {
+      await this.sessions.prompt(message.conversationId, prompt, {
+        onText: async (text) => {
+          agentOutputStarted = true;
+          if (thoughtStarted && !answerStarted) {
+            answerStarted = true;
+            await reply.write("\n\n## Answer\n\n");
+          }
+          await reply.write(text);
+        },
+        onThought: async (text) => {
+          agentOutputStarted = true;
+          if (!thoughtStarted) {
+            thoughtStarted = true;
+            await reply.write("## Thought\n\n");
+          }
+          await reply.write(text);
+        },
+        onArtifact: (artifact, caption) => {
+          agentOutputStarted = true;
+          return reply.sendArtifact(artifact, caption);
+        },
+        onComplete: () => reply.finish(),
+        policy,
+      });
+    } finally {
+      if (progressTimer) clearTimeout(progressTimer);
+    }
   }
 
   private async handleStatus(message: QQInboundMessage): Promise<void> {

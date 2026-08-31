@@ -31,6 +31,7 @@ const MAX_ARTIFACTS_PER_TURN = 2;
 const STREAM_LENGTH_MARGIN = 64;
 const STREAM_UPDATE_INTERVAL_MS = 300;
 const STREAM_DIAGNOSTIC_INTERVAL_MS = 1_000;
+const PASSIVE_REPLY_SAFE_MS = 4 * 60 * 1000;
 const STREAM_EMPTY_PLACEHOLDER = "…";
 const STREAM_COMPLETION_MARKER = "\n\n🔚";
 const STREAM_RECOVERY_MARKER =
@@ -49,6 +50,7 @@ export interface QQMessageApi {
 }
 
 export interface QQReplyStream {
+  sendProgress(text: string): Promise<void>;
   write(text: string): Promise<void>;
   flush(): Promise<void>;
   sendArtifact(
@@ -71,6 +73,7 @@ export class QQSender {
     private readonly api: QQMessageApi,
     private readonly getConfig: () => BotConfig,
     private readonly log: (message: string) => void = () => {},
+    private readonly now: () => number = Date.now,
   ) {}
 
   createReply(message: QQInboundMessage): QQReplyStream {
@@ -79,6 +82,9 @@ export class QQSender {
       message,
       this.getConfig().output,
       this.log,
+      false,
+      true,
+      this.now,
     );
   }
 
@@ -110,6 +116,7 @@ export class QQSender {
       this.log,
       options.isWakeup === true,
       false,
+      this.now,
     );
     const pause = options.pause;
     if (options.delayMinutes !== undefined) {
@@ -177,6 +184,7 @@ class BufferedQQReply implements QQReplyStream {
   private streamStartedAt?: number;
   private streamRecovered = false;
   private readonly streamTrace = nextStreamTrace++;
+  private readonly createdAt: number;
 
   constructor(
     private readonly api: QQMessageApi,
@@ -185,10 +193,17 @@ class BufferedQQReply implements QQReplyStream {
     private readonly log: (message: string) => void,
     private readonly forceWakeup = false,
     private readonly allowRecovery = true,
-  ) {}
+    private readonly now: () => number = Date.now,
+  ) {
+    this.createdAt = now();
+  }
 
   write(text: string): Promise<void> {
     return this.enqueue(() => this.writeNow(text));
+  }
+
+  sendProgress(text: string): Promise<void> {
+    return this.enqueue(() => this.sendProgressNow(text));
   }
 
   flush(): Promise<void> {
@@ -217,6 +232,20 @@ class BufferedQQReply implements QQReplyStream {
       return;
     }
     await this.flushProgressive();
+  }
+
+  private async sendProgressNow(text: string): Promise<void> {
+    if (this.finished) throw new Error("Cannot write to a finished QQ reply");
+    const rendered = this.render(text);
+    if (!rendered) return;
+    await this.api.sendText({
+      chatType: this.message.chatType,
+      targetId: this.message.targetId,
+      text: rendered,
+      replyToId: this.message.messageId,
+      sequence: this.allocateSequence(),
+      markdown: this.effectiveMarkdownMode() === "native",
+    });
   }
 
   private async flushNow(): Promise<void> {
@@ -260,12 +289,13 @@ class BufferedQQReply implements QQReplyStream {
       fileType: qqMediaFileType(artifact.kind),
       fileName: artifact.fileName,
     });
+    const passive = this.passiveReplyAvailable();
     await this.api.sendMedia({
       chatType: this.message.chatType,
       targetId: this.message.targetId,
       fileInfo,
-      replyToId: this.message.messageId,
-      sequence: this.allocateSequence(),
+      replyToId: passive ? this.message.messageId : undefined,
+      sequence: passive ? this.allocateSequence() : undefined,
       caption: caption ? renderMarkdownForQQ(caption) : undefined,
     });
     this.artifactsSent++;
@@ -288,7 +318,7 @@ class BufferedQQReply implements QQReplyStream {
     this.buffer = "";
     const chunks = capReplyChunks(
       this.split(rendered),
-      this.maxPassiveReplies() - this.sent,
+      this.availableReplySlots(),
       this.output.textChunkLimit,
       (text, limit) => this.split(text, limit),
     );
@@ -406,7 +436,7 @@ class BufferedQQReply implements QQReplyStream {
     const contentType =
       this.effectiveMarkdownMode() === "native" ? "markdown" : "text";
     this.log(
-      `QQ stream frame sending trace=${this.streamTrace} index=${frameIndex} state=${state} chars=${characters} deltaChars=${deltaCharacters} bytes=${bytes} idleMs=${idleMs} streamAgeMs=${streamAgeMs} contentType=${contentType} streamStarted=${this.streamMessageId !== undefined} recovered=${this.streamRecovered} wakeup=${this.forceWakeup || this.streamRecovered}`,
+      `QQ stream frame sending trace=${this.streamTrace} index=${frameIndex} state=${state} chars=${characters} deltaChars=${deltaCharacters} bytes=${bytes} idleMs=${idleMs} streamAgeMs=${streamAgeMs} contentType=${contentType} streamStarted=${this.streamMessageId !== undefined} recovered=${this.streamRecovered} wakeup=${this.shouldWakeup()}`,
     );
     let response: QQStreamMessageResponse;
     try {
@@ -419,11 +449,11 @@ class BufferedQQReply implements QQReplyStream {
         state,
         contentType,
         streamMessageId: this.streamMessageId,
-        isWakeup: this.forceWakeup || this.streamRecovered,
+        isWakeup: this.shouldWakeup(),
       });
     } catch (error) {
       this.log(
-        `QQ stream frame failed trace=${this.streamTrace} index=${frameIndex} state=${state} chars=${characters} deltaChars=${deltaCharacters} bytes=${bytes} idleMs=${idleMs} streamAgeMs=${streamAgeMs} contentType=${contentType} streamStarted=${this.streamMessageId !== undefined} recovered=${this.streamRecovered} wakeup=${this.forceWakeup || this.streamRecovered} error=${streamErrorCategory(error)}${streamErrorDetails(error)}`,
+        `QQ stream frame failed trace=${this.streamTrace} index=${frameIndex} state=${state} chars=${characters} deltaChars=${deltaCharacters} bytes=${bytes} idleMs=${idleMs} streamAgeMs=${streamAgeMs} contentType=${contentType} streamStarted=${this.streamMessageId !== undefined} recovered=${this.streamRecovered} wakeup=${this.shouldWakeup()} error=${streamErrorCategory(error)}${streamErrorDetails(error)}`,
       );
       if (this.canRecoverExpiredStream(error)) {
         await this.recoverExpiredStream(text, state);
@@ -505,12 +535,13 @@ class BufferedQQReply implements QQReplyStream {
 
   private async sendChunks(chunks: string[]): Promise<void> {
     for (const text of chunks) {
+      const passive = this.passiveReplyAvailable();
       await this.api.sendText({
         chatType: this.message.chatType,
         targetId: this.message.targetId,
         text,
-        replyToId: this.message.messageId,
-        sequence: this.allocateSequence(),
+        replyToId: passive ? this.message.messageId : undefined,
+        sequence: passive ? this.allocateSequence() : undefined,
         markdown: this.effectiveMarkdownMode() === "native",
       });
     }
@@ -533,6 +564,27 @@ class BufferedQQReply implements QQReplyStream {
       case "channel":
         return CHANNEL_MAX_PASSIVE_REPLIES;
     }
+  }
+
+  private passiveReplyAvailable(): boolean {
+    return (
+      this.message.chatType === "direct" ||
+      this.now() - this.createdAt < PASSIVE_REPLY_SAFE_MS
+    );
+  }
+
+  private availableReplySlots(): number {
+    return this.passiveReplyAvailable()
+      ? this.maxPassiveReplies() - this.sent
+      : this.maxPassiveReplies();
+  }
+
+  private shouldWakeup(): boolean {
+    return (
+      this.forceWakeup ||
+      this.streamRecovered ||
+      this.now() - this.createdAt >= PASSIVE_REPLY_SAFE_MS
+    );
   }
 }
 
