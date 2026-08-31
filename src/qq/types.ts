@@ -17,6 +17,7 @@ export interface QQInboundMessage {
   timestamp: string;
   text: string;
   attachments: QQAttachment[];
+  addressed?: boolean;
 }
 
 export interface QQGatewayEvent {

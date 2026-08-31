@@ -412,6 +412,7 @@ class BufferedQQReply implements QQReplyStream {
   private sent = 0;
   private artifactsSent = 0;
   private deferredDeliveries = 0;
+  private activeGroupUnavailable = false;
   private readonly artifactDigests = new Set<string>();
   private finished = false;
   private operationChain = Promise.resolve();
@@ -548,6 +549,11 @@ class BufferedQQReply implements QQReplyStream {
       throw new Error("No QQ reply slot remains for another artifact");
     }
     if (!this.passiveReplyAvailable()) {
+      if (await this.tryActiveArtifact(artifact, caption)) {
+        this.artifactsSent++;
+        this.artifactDigests.add(artifact.digest);
+        return { alreadySent: false };
+      }
       await this.defer({
         kind: "artifact",
         artifact,
@@ -824,6 +830,7 @@ class BufferedQQReply implements QQReplyStream {
   private async sendChunks(chunks: string[]): Promise<void> {
     for (const text of chunks) {
       if (!this.passiveReplyAvailable()) {
+        if (await this.tryActiveText(text)) continue;
         await this.defer({
           kind: "text",
           text,
@@ -897,6 +904,87 @@ class BufferedQQReply implements QQReplyStream {
   private async defer(delivery: Delivery): Promise<void> {
     await this.deferDelivery(this.deliveryBatchId, delivery);
     this.deferredDeliveries++;
+  }
+
+  private async tryActiveText(text: string): Promise<boolean> {
+    if (
+      this.message.chatType !== "group" ||
+      this.activeGroupUnavailable
+    ) {
+      return false;
+    }
+    try {
+      const confirmationId = await this.api.sendText({
+        chatType: "group",
+        targetId: this.message.targetId,
+        text,
+        markdown: this.effectiveMarkdownMode() === "native",
+      });
+      await this.rememberDelivered(this.deliveryBatchId, {
+        kind: "text",
+        text,
+        markdown: this.effectiveMarkdownMode() === "native",
+      });
+      this.markDelivered();
+      this.log(
+        `QQ active group text confirmed conversation=${conversationLogId(this.message.conversationId)} confirmation=${confirmationLogId(confirmationId)}`,
+      );
+      return true;
+    } catch (error) {
+      if (isActiveGroupPermissionError(error)) {
+        this.activeGroupUnavailable = true;
+      }
+      this.log(
+        `QQ active group text unavailable conversation=${conversationLogId(this.message.conversationId)} error=${deliveryErrorCategory(error)}`,
+      );
+      return false;
+    }
+  }
+
+  private async tryActiveArtifact(
+    artifact: PreparedArtifact,
+    caption?: string,
+  ): Promise<boolean> {
+    if (
+      this.message.chatType !== "group" ||
+      this.activeGroupUnavailable
+    ) {
+      return false;
+    }
+    try {
+      const fileInfo = await this.api.uploadMedia({
+        chatType: "group",
+        targetId: this.message.targetId,
+        data: artifact.data,
+        fileType: qqMediaFileType(artifact.kind),
+        fileName: artifact.fileName,
+      });
+      const renderedCaption = caption ? renderMarkdownForQQ(caption) : undefined;
+      const confirmationId = await this.api.sendMedia({
+        chatType: "group",
+        targetId: this.message.targetId,
+        fileInfo,
+        caption: renderedCaption,
+      });
+      await this.rememberDelivered(this.deliveryBatchId, {
+        kind: "artifact",
+        artifact,
+        caption: renderedCaption,
+      });
+      this.markDelivered();
+      this.log(
+        `QQ active group artifact confirmed conversation=${conversationLogId(this.message.conversationId)} confirmation=${confirmationLogId(confirmationId)}`,
+      );
+      return true;
+    } catch (error) {
+      if (isActiveGroupPermissionError(error)) {
+        this.activeGroupUnavailable = true;
+      }
+      this.log(
+        `QQ active group artifact unavailable conversation=${conversationLogId(this.message.conversationId)} error=${deliveryErrorCategory(error)}`,
+      );
+      return false;
+    }
   }
 }
 
@@ -977,6 +1065,14 @@ function deliveryErrorCategory(error: unknown): string {
     return `http-${error.status}${error.code === undefined ? "" : `-code-${error.code}`}`;
   }
   return error instanceof Error ? error.name : typeof error;
+}
+
+function isActiveGroupPermissionError(error: unknown): boolean {
+  return (
+    error instanceof QQApiError &&
+    error.status === 400 &&
+    String(error.code) === "40034105"
+  );
 }
 
 function capReplyChunks(

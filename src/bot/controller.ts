@@ -40,6 +40,7 @@ export class BotController {
   }
 
   async handleMessage(message: QQInboundMessage): Promise<void> {
+    if (!shouldHandleMessage(message)) return;
     const command = parseControlCommand(message.text);
 
     if (command?.kind === "id") {
@@ -48,6 +49,7 @@ export class BotController {
       } else {
         await this.sender.reply(message, `Your QQ Bot OpenID is:\n${message.senderId}`);
       }
+
       return;
     }
 
@@ -271,7 +273,7 @@ export class BotController {
           `Delivery: ${delivery.pending} pending item(s), ${delivery.recent} recent confirmed item(s).`,
           message.chatType === "direct"
             ? "QQ direct passive replies expire after 60 minutes. Retry resends the latest result; Seen clears it."
-            : "QQ group replies expire after 5 minutes. Status retrieves pending results; Retry resends the latest result.",
+            : "QQ group passive replies expire after 5 minutes. The Bot then tries active delivery; if unavailable, mention the Bot again to retrieve the pending result.",
           "",
           "多个 QQ 会话会在同一个工作区并发运行。无关任务可以同时进行；编辑重叠文件时，Agent 必须先检查 Git 状态和协调声明。",
         ].join("\n"),
@@ -603,6 +605,10 @@ function json(value: unknown): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+export function shouldHandleMessage(message: QQInboundMessage): boolean {
+  return message.addressed !== false;
 }
 
 function helpText(): string {
