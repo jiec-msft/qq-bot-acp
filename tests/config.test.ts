@@ -28,12 +28,17 @@ test("configuration paths are independent of cwd and conversations", async () =>
   const home = path.join("C:", "Users", "example");
   const paths = resolveBotPaths("work", home);
   assert.equal(paths.root, path.join(home, ".qq-bot-acp", "instances", "work"));
+  assert.equal(paths.forumQueue, path.join(paths.root, "forum-queue.json"));
 });
 
 test("configuration values support JSON and validated dotted updates", async () => {
   const { config } = await fixture();
   assert.deepEqual(config.access.allowFrom, []);
   assert.deepEqual(config.access.groupAllowFrom, []);
+  assert.deepEqual(config.qq.forum, {
+    enabled: false,
+    guildAllowFrom: [],
+  });
   assert.deepEqual(config.sessions.defaultOptions, {
     model: "gpt-5.6-sol",
     reasoning_effort: "medium",
@@ -64,6 +69,33 @@ test("legacy configurations receive output formatting defaults", async () => {
   assert.deepEqual(parsed.output, config.output);
   assert.deepEqual(parsed.sessions.defaultOptions, config.sessions.defaultOptions);
   assert.equal(parsed.output.markdownMode, "native");
+  assert.deepEqual(parsed.qq.forum, {
+    enabled: false,
+    guildAllowFrom: [],
+  });
+});
+
+test("forum configuration requires explicit guild IDs", () => {
+  const config = createInitialConfig({
+    appId: "app",
+    clientSecretFile: "secret",
+    agentCommand: "agent",
+  });
+
+  assert.deepEqual(
+    setConfigValue(config, "qq.forum", {
+      enabled: true,
+      guildAllowFrom: ["2193686490806678807"],
+    }).qq.forum,
+    {
+      enabled: true,
+      guildAllowFrom: ["2193686490806678807"],
+    },
+  );
+  assert.throws(
+    () => setConfigValue(config, "qq.forum.guildAllowFrom", ["*"]),
+    /guild ID/i,
+  );
 });
 
 test("admin CLI bootstrap cannot replace an existing administrator", async () => {

@@ -10,6 +10,8 @@ import type {
   QQSendStreamInput,
   QQStreamMessageResponse,
   QQSendTextInput,
+  QQPublishForumThreadInput,
+  QQPublishForumThreadResponse,
   QQUploadMediaInput,
 } from "./api.js";
 import { QQApiError } from "./api.js";
@@ -26,7 +28,17 @@ import {
   splitText,
   trimBlockStart,
 } from "./format.js";
-import type { QQInboundMessage } from "./types.js";
+import {
+  forumResultTitle,
+  type QQForumPublisher,
+} from "./forum.js";
+import type {
+  QQForumInboundMessage,
+  QQInboundMessage,
+  QQStandardInboundMessage,
+} from "./types.js";
+
+export { forumResultTitle } from "./forum.js";
 
 const DIRECT_MAX_PASSIVE_REPLIES = 4;
 const GROUP_MAX_PASSIVE_REPLIES = 5;
@@ -55,6 +67,9 @@ export interface QQMessageApi {
   sendStream(input: QQSendStreamInput): Promise<QQStreamMessageResponse>;
   uploadMedia(input: QQUploadMediaInput): Promise<string>;
   sendMedia(input: QQSendMediaInput): Promise<string>;
+  publishForumThread(
+    input: QQPublishForumThreadInput,
+  ): Promise<QQPublishForumThreadResponse>;
 }
 
 export interface QQReplyStream {
@@ -87,6 +102,7 @@ export class QQSender {
     private readonly now: () => number = Date.now,
     private readonly retryPause?: (milliseconds: number) => Promise<void>,
     deliveryRoot?: string,
+    private readonly forumPublisher?: QQForumPublisher,
   ) {
     this.deliveries = new DeliveryStore(deliveryRoot, now);
   }
@@ -99,6 +115,14 @@ export class QQSender {
     message: QQInboundMessage,
     rememberDeliveries = true,
   ): QQReplyStream {
+    if (message.chatType === "forum") {
+      return new BufferedQQForumReply(
+        this.api,
+        message,
+        this.log,
+        this.forumPublisher,
+      );
+    }
     return new BufferedQQReply(
       this.api,
       message,
@@ -139,7 +163,12 @@ export class QQSender {
 
   async retryRecent(message: QQInboundMessage): Promise<number> {
     return this.withDeliveryLock(message.conversationId, async () => {
-      if (message.chatType === "channel") return 0;
+      if (
+        message.chatType === "channel" ||
+        message.chatType === "forum"
+      ) {
+        return 0;
+      }
       const recent = await this.deliveries.getRecent(message.conversationId);
       if (recent.length === 0) return 0;
       return this.sendStoredDeliveries(message, recent, true);
@@ -160,7 +189,12 @@ export class QQSender {
   }
 
   private async deliverPendingNow(message: QQInboundMessage): Promise<number> {
-    if (message.chatType === "channel") return 0;
+    if (
+      message.chatType === "channel" ||
+      message.chatType === "forum"
+    ) {
+      return 0;
+    }
     const chatType = message.chatType;
     let delivered = 0;
     let sequence = 1;
@@ -224,7 +258,7 @@ export class QQSender {
     retry: boolean,
   ): Promise<string> {
     const chatType = message.chatType;
-    if (chatType === "channel") {
+    if (chatType === "channel" || chatType === "forum") {
       throw new Error("QQ deferred delivery is not supported in channel chats");
     }
     if (item.kind === "text") {
@@ -407,6 +441,80 @@ export class QQSender {
   }
 }
 
+class BufferedQQForumReply implements QQReplyStream {
+  private buffer = "";
+  private finished = false;
+  private operationChain = Promise.resolve();
+
+  constructor(
+    private readonly api: Pick<QQMessageApi, "publishForumThread">,
+    private readonly message: QQForumInboundMessage,
+    private readonly log: (message: string) => void,
+    private readonly publisher?: QQForumPublisher,
+  ) {}
+
+  sendProgress(_text: string): Promise<boolean> {
+    return Promise.resolve(false);
+  }
+
+  getLastDeliveryAt(): number | undefined {
+    return undefined;
+  }
+
+  write(text: string): Promise<void> {
+    return this.enqueue(async () => {
+      if (this.finished) {
+        throw new Error("Cannot write to a finished QQ forum reply");
+      }
+      this.buffer += text;
+    });
+  }
+
+  flush(): Promise<void> {
+    return this.enqueue(async () => {});
+  }
+
+  sendArtifact(
+    _artifact: PreparedArtifact,
+    _caption?: string,
+  ): Promise<{ alreadySent: boolean }> {
+    return Promise.reject(
+      new Error("QQ forum artifact publication is not supported"),
+    );
+  }
+
+  finish(): Promise<void> {
+    return this.enqueue(async () => {
+      if (this.finished) return;
+      const content = this.buffer.trim() || "No response was produced.";
+      const response = this.publisher
+        ? await this.publisher.publishForumResult(this.message, content)
+        : await this.api.publishForumThread({
+            channelId: this.message.forum.channelId,
+            title: forumResultTitle(
+              this.message.forum.botUsername,
+              this.message.forum.sourceTitle,
+            ),
+            content,
+            format: 3,
+          });
+      this.finished = true;
+      this.log(
+        `QQ forum result published conversation=${conversationLogId(this.message.conversationId)} task=${confirmationLogId(response.taskId)}`,
+      );
+    });
+  }
+
+  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.operationChain.then(operation);
+    this.operationChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+}
+
 class BufferedQQReply implements QQReplyStream {
   private buffer = "";
   private sent = 0;
@@ -432,7 +540,7 @@ class BufferedQQReply implements QQReplyStream {
 
   constructor(
     private readonly api: QQMessageApi,
-    private readonly message: QQInboundMessage,
+    private readonly message: QQStandardInboundMessage,
     private readonly output: BotConfig["output"],
     private readonly log: (message: string) => void,
     private readonly forceWakeup = false,
@@ -1009,6 +1117,8 @@ function pendingReplyLimit(chatType: QQInboundMessage["chatType"]): number {
       return GROUP_MAX_PASSIVE_REPLIES;
     case "channel":
       return CHANNEL_MAX_PASSIVE_REPLIES;
+    case "forum":
+      return 0;
   }
 }
 
@@ -1045,6 +1155,8 @@ function passiveReplyWindowMs(
       return GROUP_PASSIVE_REPLY_MS;
     case "channel":
       return CHANNEL_PASSIVE_REPLY_MS;
+    case "forum":
+      return 0;
   }
 }
 

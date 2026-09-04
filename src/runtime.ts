@@ -8,6 +8,7 @@ import type { BotConfig } from "./config/schema.js";
 import { ConfigStore } from "./config/store.js";
 import { QQApi } from "./qq/api.js";
 import { QQControls } from "./qq/controls.js";
+import { QQForumCoordinator } from "./qq/forum.js";
 import { QQGateway } from "./qq/gateway.js";
 import { QQSender } from "./qq/sender.js";
 import { AttachmentStager } from "./uploads/stager.js";
@@ -16,6 +17,7 @@ import { WorkspaceRepository } from "./workspace/repository.js";
 export class BotRuntime {
   private readonly sessions: SessionManager;
   private readonly gateway: QQGateway;
+  private readonly forum: QQForumCoordinator;
   private readonly controller: BotController;
   private readonly sender: QQSender;
   private readonly stager: AttachmentStager;
@@ -34,6 +36,14 @@ export class BotRuntime {
       log,
     );
     let controller!: BotController;
+    const forum = new QQForumCoordinator(
+      api,
+      () => controller.getConfig(),
+      (message) => controller.handleMessage(message),
+      log,
+      store.paths.forumQueue,
+    );
+    this.forum = forum;
     const sender = new QQSender(
       api,
       () => controller.getConfig(),
@@ -41,6 +51,7 @@ export class BotRuntime {
       Date.now,
       undefined,
       store.paths.deliveries,
+      forum,
     );
     this.sender = sender;
     const controls = new QQControls(api);
@@ -61,6 +72,13 @@ export class BotRuntime {
       store.paths.state,
       (message) => controller.handleMessage(message),
       log,
+      {
+        forumEnabled: config.qq.forum.enabled,
+        onForumThreadCreate: (event) => forum.handleThread(event),
+        onForumPublishAuditResult: (event) =>
+          forum.handlePublishAudit(event),
+        onBotIdentity: (identity) => forum.setBotIdentity(identity),
+      },
     );
   }
 
@@ -96,8 +114,10 @@ export class BotRuntime {
     await this.stager.start();
     this.sessions.start();
     try {
+      await this.forum.start();
       await this.gateway.start();
       await this.gateway.ready;
+      await this.forum.applyCurrentAccessPolicy();
     } catch (error) {
       await this.stop();
       throw error;
@@ -105,6 +125,7 @@ export class BotRuntime {
   }
 
   async stop(): Promise<void> {
+    this.forum.stop();
     this.sender.stop();
     await Promise.allSettled([this.gateway.stop(), this.sessions.stop()]);
     await this.artifacts.stop();

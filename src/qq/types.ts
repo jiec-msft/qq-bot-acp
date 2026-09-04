@@ -1,4 +1,4 @@
-export type QQChatType = "direct" | "group" | "channel";
+export type QQChatType = "direct" | "group" | "channel" | "forum";
 
 export interface QQAttachment {
   contentType: string;
@@ -6,10 +6,9 @@ export interface QQAttachment {
   filename?: string;
 }
 
-export interface QQInboundMessage {
+interface QQInboundMessageBase {
   accountId: string;
   conversationId: string;
-  chatType: QQChatType;
   senderId: string;
   senderName?: string;
   targetId: string;
@@ -19,6 +18,26 @@ export interface QQInboundMessage {
   attachments: QQAttachment[];
   addressed?: boolean;
 }
+
+export interface QQStandardInboundMessage extends QQInboundMessageBase {
+  chatType: Exclude<QQChatType, "forum">;
+  forum?: never;
+}
+
+export interface QQForumInboundMessage extends QQInboundMessageBase {
+  chatType: "forum";
+  forum: {
+    guildId: string;
+    channelId: string;
+    threadId: string;
+    sourceTitle: string;
+    botUsername: string;
+  };
+}
+
+export type QQInboundMessage =
+  | QQStandardInboundMessage
+  | QQForumInboundMessage;
 
 export interface QQGatewayEvent {
   op: number;

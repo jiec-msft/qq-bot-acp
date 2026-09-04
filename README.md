@@ -173,6 +173,52 @@ restored automatically.
 Changes under `qq.*` require a restart. Agent changes terminate active ACP
 processes so each conversation starts against the new agent.
 
+## QQ forum posts
+
+Forum automation requires a **private-domain (私域) QQ bot**. It is disabled by
+default and requires an explicit guild allowlist:
+
+```text
+/config qq.forum.enabled true
+/config qq.forum.guildAllowFrom ["YOUR_GUILD_ID"]
+```
+
+Restart the bridge after changing `qq.forum.*`. The bridge automatically
+discards Gateway state recorded with a different intent set. When enabled, it
+requests only the private `FORUM_EVENT` intent (`1 << 28`) and consumes the full
+`FORUM_THREAD_CREATE` event directly.
+
+Do not enable this setting for a public-domain bot. Public-domain bots reject
+that intent, so Gateway identification will fail. After private capability is
+enabled in the QQ platform, remove the bot from the guild and add it again so
+the API capability takes effect.
+
+Private-domain bots receive the forum APIs automatically. Permission cards do
+not grant public-domain bots access to forum thread listing or publishing.
+Only a thread starting with a real Bot mention, or a leading literal
+`@BotName` followed by whitespace or punctuation, starts the Agent.
+
+Each source thread has an isolated ACP conversation. Progress posts are
+suppressed, and the completed answer is published as one new Markdown forum
+thread. Result publication is serialized per forum channel, but ACP turns for
+different source threads can still run concurrently.
+
+QQ accepts the thread `PUT` asynchronously. The bridge therefore keeps the
+source event pending until a successful `FORUM_PUBLISH_AUDIT_RESULT` arrives.
+An audit failure retains the source and saved result for a controlled retry.
+Each result title ends with a short deterministic marker such as
+`[C:1a2b3c4d]`. This visible suffix is required because the audit event does not
+include the `task_id` returned by `PUT`.
+
+Pending events and in-flight publication state persist in `forum-queue.json`.
+After a restart, the private-bot thread-list API is polled for a bounded grace
+period. A matching title marker completes the source without another `PUT`;
+otherwise the saved result is published again without rerunning the ACP turn.
+Events from guilds outside `guildAllowFrom` are never added to this queue, and
+queued events are deleted if their guild is removed from the allowlist.
+Disabling forum support globally keeps allowed pending work but does not launch
+it. Explicit artifact publication is not supported for forum turns.
+
 ## Output formatting and streaming
 
 Direct-chat responses use QQ's official
