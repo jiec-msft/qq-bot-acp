@@ -8,14 +8,58 @@ import type {
   QQInboundMessage,
 } from "./types.js";
 
-const INTENTS = (1 << 25) | (1 << 30) | (1 << 12);
+const BASE_INTENTS = (1 << 25) | (1 << 30) | (1 << 12);
+const FORUM_EVENT_INTENT = 1 << 28;
 const MAX_RECONNECT_DELAY_MS = 30_000;
 
 interface GatewayState {
   version: 1;
   appId?: string;
+  intents?: number;
   sessionId?: string;
   sequence?: number;
+  botUserId?: string;
+  botUsername?: string;
+}
+
+export interface QQBotIdentity {
+  id: string;
+  username: string;
+}
+
+export interface QQForumThreadCreateEvent {
+  guildId: string;
+  channelId: string;
+  authorId?: string;
+  threadInfo: {
+    threadId: string;
+    title: unknown;
+    content: unknown;
+    dateTime: string;
+  };
+}
+
+export interface QQForumPublishAuditEvent {
+  guildId: string;
+  channelId: string;
+  authorId?: string;
+  type: number;
+  result: number;
+  errorMessage?: string;
+  threadId?: string;
+  postId?: string;
+  replyId?: string;
+}
+
+export interface QQGatewayOptions {
+  forumEnabled?: boolean;
+  onForumThreadCreate?: (
+    event: QQForumThreadCreateEvent,
+  ) => Promise<void>;
+  onForumPublishAuditResult?: (
+    event: QQForumPublishAuditEvent,
+  ) => Promise<void>;
+  onBotIdentity?: (identity: QQBotIdentity) => void;
 }
 
 export class QQGateway {
@@ -29,14 +73,21 @@ export class QQGateway {
   private reconnectAttempt = 0;
   private state: GatewayState;
   private payloadChain = Promise.resolve();
+  private stateOperations = Promise.resolve();
+  private connectionGeneration = 0;
 
   constructor(
     private readonly api: QQApi,
     private readonly stateFile: string,
     private readonly onMessage: (message: QQInboundMessage) => Promise<void>,
     private readonly log: (message: string) => void,
+    private readonly options: QQGatewayOptions = {},
   ) {
-    this.state = { version: 1, appId: api.appId };
+    this.state = {
+      version: 1,
+      appId: api.appId,
+      intents: gatewayIntents(options.forumEnabled === true),
+    };
     this.ready = new Promise<void>((resolve, reject) => {
       this.resolveReady = resolve;
       this.rejectReady = reject;
@@ -58,17 +109,22 @@ export class QQGateway {
     try {
       const url = await this.api.getGatewayUrl();
       if (this.stopped) return;
+      const generation = await this.withStateLock(async () => {
+        if (this.stopped) return undefined;
+        return ++this.connectionGeneration;
+      });
+      if (generation === undefined) return;
       const socket = new WebSocket(url);
+      this.clearHeartbeat();
       this.socket = socket;
+      this.payloadChain = Promise.resolve();
 
       socket.on("open", () => this.log("QQ gateway socket connected"));
       socket.on("message", (data) => {
-        const raw = String(data);
-        this.payloadChain = this.payloadChain
-          .then(() => this.handlePayload(raw))
-          .catch((error) => this.log(`QQ gateway payload failed: ${String(error)}`));
+        this.queuePayload(socket, String(data), generation);
       });
       socket.on("error", (error) => {
+        if (!this.isCurrentConnection(generation, socket)) return;
         this.log(`QQ gateway error: ${error.message}`);
         if (!this.readySettled) {
           this.readySettled = true;
@@ -76,6 +132,8 @@ export class QQGateway {
         }
       });
       socket.on("close", (code) => {
+        if (!this.isCurrentConnection(generation, socket)) return;
+        this.socket = undefined;
         this.clearHeartbeat();
         if (!this.stopped && code !== 1000) void this.scheduleReconnect();
       });
@@ -88,7 +146,27 @@ export class QQGateway {
     }
   }
 
-  private async handlePayload(raw: string): Promise<void> {
+  private queuePayload(
+    socket: WebSocket,
+    raw: string,
+    generation = this.connectionGeneration,
+  ): void {
+    if (!this.isCurrentConnection(generation, socket)) return;
+    this.payloadChain = this.payloadChain
+      .then(() => this.handlePayload(raw, generation, socket))
+      .catch((error) => {
+        this.log(`QQ gateway payload failed: ${String(error)}`);
+        socket.close(4002, "payload handling failed");
+        return new Promise<void>(() => {});
+      });
+  }
+
+  private async handlePayload(
+    raw: string,
+    generation = this.connectionGeneration,
+    socket = this.socket,
+  ): Promise<void> {
+    if (!this.isCurrentConnection(generation, socket)) return;
     let payload: QQGatewayEvent;
     try {
       payload = JSON.parse(raw) as QQGatewayEvent;
@@ -97,30 +175,60 @@ export class QQGateway {
       return;
     }
 
+    const durableForumDispatch =
+      payload.op === 0 &&
+      (
+        payload.t === "FORUM_THREAD_CREATE" ||
+        payload.t === "FORUM_PUBLISH_AUDIT_RESULT"
+      ) &&
+      this.options.forumEnabled === true;
+    if (durableForumDispatch) {
+      await this.handleDispatch(payload.t, payload.d, generation, socket);
+      if (payload.s !== undefined) {
+        await this.saveSequence(payload.s, generation, socket);
+      }
+      return;
+    }
+
+    if (payload.op === 0 && payload.t === "READY") {
+      await this.handleDispatch(payload.t, payload.d, generation, socket);
+      if (payload.s !== undefined) {
+        await this.saveSequence(payload.s, generation, socket);
+      }
+      return;
+    }
+
     if (payload.s !== undefined) {
-      this.state.sequence = payload.s;
-      await this.saveState();
+      await this.saveSequence(payload.s, generation, socket);
     }
 
     switch (payload.op) {
       case 10:
-        this.handleHello(payload.d);
+        this.handleHello(payload.d, generation, socket);
         return;
       case 0:
-        await this.handleDispatch(payload.t, payload.d);
+        await this.handleDispatch(payload.t, payload.d, generation, socket);
         return;
       case 7:
-        this.socket?.close(4000, "server requested reconnect");
+        socket?.close(4000, "server requested reconnect");
         return;
       case 9:
-        this.state = { version: 1, appId: this.api.appId };
-        await this.saveState();
-        this.socket?.close(4001, "invalid session");
+        await this.replaceState(generation, {
+          version: 1,
+          appId: this.api.appId,
+          intents: gatewayIntents(this.options.forumEnabled === true),
+        }, socket);
+        socket?.close(4001, "invalid session");
         return;
     }
   }
 
-  private handleHello(data: unknown): void {
+  private handleHello(
+    data: unknown,
+    generation: number,
+    socket?: WebSocket,
+  ): void {
+    if (!this.isCurrentConnection(generation, socket)) return;
     const interval =
       typeof data === "object" &&
       data !== null &&
@@ -130,7 +238,12 @@ export class QQGateway {
         : 41_250;
     this.clearHeartbeat();
     this.heartbeat = setInterval(() => {
-      this.send({ op: 1, d: this.state.sequence ?? null });
+      this.send(
+        { op: 1, d: this.state.sequence ?? null },
+        false,
+        generation,
+        socket,
+      );
     }, interval);
     this.heartbeat.unref();
 
@@ -142,13 +255,13 @@ export class QQGateway {
           session_id: this.state.sessionId,
           seq: this.state.sequence,
         },
-      }, true);
+      }, true, generation, socket);
     } else {
       this.send({
         op: 2,
         d: {
           token: `QQBot ${this.currentTokenPlaceholder()}`,
-          intents: INTENTS,
+          intents: gatewayIntents(this.options.forumEnabled === true),
           shard: [0, 1],
           properties: {
             os: process.platform,
@@ -156,15 +269,41 @@ export class QQGateway {
             device: "qq-bot-acp",
           },
         },
-      }, true);
+      }, true, generation, socket);
     }
   }
 
-  private async handleDispatch(type: string | undefined, data: unknown): Promise<void> {
+  private async handleDispatch(
+    type: string | undefined,
+    data: unknown,
+    generation: number,
+    socket?: WebSocket,
+  ): Promise<void> {
+    if (!this.isCurrentConnection(generation, socket)) return;
     if (type === "READY") {
-      const ready = data as { session_id?: string };
-      this.state.sessionId = ready.session_id;
-      await this.saveState();
+      const ready = asRecord(data);
+      const user = asRecord(ready.user);
+      const sessionId =
+        typeof ready.session_id === "string" ? ready.session_id : undefined;
+      const identity =
+        typeof user.id === "string" && typeof user.username === "string"
+          ? { id: user.id, username: user.username }
+          : undefined;
+      const updated = await this.updateState(generation, (state) => {
+        if (state.sessionId !== sessionId) state.sequence = undefined;
+        state.sessionId = sessionId;
+        state.intents = gatewayIntents(this.options.forumEnabled === true);
+        state.botUserId = identity?.id;
+        state.botUsername = identity?.username;
+      }, socket);
+      if (!updated) return;
+      if (!this.isCurrentConnection(generation, socket)) return;
+      if (identity) {
+        this.options.onBotIdentity?.({
+          id: identity.id,
+          username: identity.username,
+        });
+      }
       this.markReady("new");
       return;
     }
@@ -173,6 +312,28 @@ export class QQGateway {
       return;
     }
     if (!type || typeof data !== "object" || data === null) return;
+    if (
+      type === "FORUM_THREAD_CREATE" &&
+      this.options.forumEnabled === true
+    ) {
+      const event = normalizeForumThreadCreate(data);
+      this.log(`QQ gateway forum dispatch type=${type} accepted=${event !== null}`);
+      if (event && this.options.onForumThreadCreate) {
+        await this.options.onForumThreadCreate(event);
+      }
+      return;
+    }
+    if (
+      type === "FORUM_PUBLISH_AUDIT_RESULT" &&
+      this.options.forumEnabled === true
+    ) {
+      const event = normalizeForumPublishAuditResult(data);
+      this.log(`QQ gateway forum dispatch type=${type} accepted=${event !== null}`);
+      if (event && this.options.onForumPublishAuditResult) {
+        await this.options.onForumPublishAuditResult(event);
+      }
+      return;
+    }
     const message = normalizeInbound(type, data as Record<string, unknown>, this.api.appId);
     if (isMessageDispatch(type)) {
       this.log(
@@ -185,17 +346,24 @@ export class QQGateway {
     });
   }
 
-  private send(payload: unknown, needsToken = false): void {
+  private send(
+    payload: unknown,
+    needsToken = false,
+    generation = this.connectionGeneration,
+    socket = this.socket,
+  ): void {
+    if (!this.isCurrentConnection(generation, socket)) return;
     if (!needsToken) {
-      this.socket?.send(JSON.stringify(payload));
+      socket?.send(JSON.stringify(payload));
       return;
     }
     void this.api.getAccessToken().then((token) => {
+      if (!this.isCurrentConnection(generation, socket)) return;
       const serialized = JSON.stringify(payload).replace(this.currentTokenPlaceholder(), token);
-      this.socket?.send(serialized);
+      socket?.send(serialized);
     }).catch((error) => {
       this.log(`Unable to authenticate QQ gateway: ${String(error)}`);
-      this.socket?.close(4004, "authentication failed");
+      socket?.close(4004, "authentication failed");
     });
   }
 
@@ -230,15 +398,150 @@ export class QQGateway {
   private async loadState(): Promise<void> {
     try {
       const parsed = JSON.parse(await fs.readFile(this.stateFile, "utf8")) as GatewayState;
-      if (parsed.version === 1 && parsed.appId === this.api.appId) this.state = parsed;
+      const intents = gatewayIntents(this.options.forumEnabled === true);
+      if (
+        parsed.version === 1 &&
+        parsed.appId === this.api.appId &&
+        parsed.intents === intents
+      ) {
+        this.state = parsed;
+        if (parsed.botUserId && parsed.botUsername) {
+          this.options.onBotIdentity?.({
+            id: parsed.botUserId,
+            username: parsed.botUsername,
+          });
+        }
+      }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
   }
 
-  private saveState(): Promise<void> {
-    return atomicWriteJson(this.stateFile, this.state);
+  private isCurrentConnection(
+    generation: number,
+    socket?: WebSocket,
+  ): boolean {
+    return (
+      generation === this.connectionGeneration &&
+      (socket === undefined || this.socket === socket)
+    );
   }
+
+  private saveSequence(
+    sequence: number,
+    generation = this.connectionGeneration,
+    socket = this.socket,
+  ): Promise<boolean> {
+    return this.updateState(generation, (state) => {
+      if (state.sequence === undefined || sequence > state.sequence) {
+        state.sequence = sequence;
+      }
+    }, socket);
+  }
+
+  private replaceState(
+    generation: number,
+    state: GatewayState,
+    socket?: WebSocket,
+  ): Promise<boolean> {
+    return this.withStateLock(async () => {
+      if (!this.isCurrentConnection(generation, socket)) return false;
+      await atomicWriteJson(this.stateFile, state);
+      if (!this.isCurrentConnection(generation, socket)) return false;
+      this.state = state;
+      return true;
+    });
+  }
+
+  private updateState(
+    generation: number,
+    update: (state: GatewayState) => void,
+    socket?: WebSocket,
+  ): Promise<boolean> {
+    return this.withStateLock(async () => {
+      if (!this.isCurrentConnection(generation, socket)) return false;
+      const next = structuredClone(this.state);
+      update(next);
+      if (
+        next.sequence === this.state.sequence &&
+        next.sessionId === this.state.sessionId &&
+        next.intents === this.state.intents &&
+        next.botUserId === this.state.botUserId &&
+        next.botUsername === this.state.botUsername
+      ) {
+        return true;
+      }
+      await atomicWriteJson(this.stateFile, next);
+      if (!this.isCurrentConnection(generation, socket)) return false;
+      this.state = next;
+      return true;
+    });
+  }
+
+  private withStateLock<T>(operation: () => Promise<T>): Promise<T> {
+    const current = this.stateOperations.then(operation);
+    this.stateOperations = current.then(
+      () => undefined,
+      () => undefined,
+    );
+    return current;
+  }
+}
+
+export function gatewayIntents(forumEnabled: boolean): number {
+  return forumEnabled
+    ? BASE_INTENTS | FORUM_EVENT_INTENT
+    : BASE_INTENTS;
+}
+
+export function normalizeForumThreadCreate(
+  value: unknown,
+): QQForumThreadCreateEvent | null {
+  const event = asRecord(value);
+  const threadInfo = asRecord(event.thread_info);
+  const guildId = String(event.guild_id ?? "");
+  const channelId = String(event.channel_id ?? "");
+  const threadId = String(threadInfo.thread_id ?? "");
+  if (!guildId || !channelId || !threadId) return null;
+  const authorId =
+    typeof event.author_id === "string" && event.author_id
+      ? event.author_id
+      : undefined;
+  return {
+    guildId,
+    channelId,
+    authorId,
+    threadInfo: {
+      threadId,
+      title: threadInfo.title ?? "",
+      content: threadInfo.content ?? "",
+      dateTime: String(threadInfo.date_time ?? ""),
+    },
+  };
+}
+
+export function normalizeForumPublishAuditResult(
+  value: unknown,
+): QQForumPublishAuditEvent | null {
+  const event = asRecord(value);
+  const guildId = String(event.guild_id ?? "");
+  const channelId = String(event.channel_id ?? "");
+  const type = numericEventValue(event.type);
+  const result = numericEventValue(event.result);
+  if (!guildId || !channelId || type === undefined || result === undefined) {
+    return null;
+  }
+  return {
+    guildId,
+    channelId,
+    authorId: optionalString(event.author_id),
+    type,
+    result,
+    errorMessage: optionalString(event.err_msg),
+    threadId: optionalString(event.thread_id),
+    postId: optionalString(event.post_id),
+    replyId: optionalString(event.reply_id),
+  };
 }
 
 export function normalizeInbound(
@@ -339,4 +642,13 @@ function asRecord(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null
     ? value as Record<string, unknown>
     : {};
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function numericEventValue(value: unknown): number | undefined {
+  const numeric = typeof value === "number" ? value : Number(value);
+  return Number.isInteger(numeric) ? numeric : undefined;
 }

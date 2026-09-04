@@ -9,6 +9,7 @@ export interface BotPaths {
   provenConfig: string;
   failedConfig: string;
   state: string;
+  forumQueue: string;
   sessions: string;
   logs: string;
   media: string;
@@ -30,6 +31,7 @@ export function resolveBotPaths(instance?: string, home = os.homedir()): BotPath
     provenConfig: path.join(root, "config.proven.json"),
     failedConfig: path.join(root, "config.failed.json"),
     state: path.join(root, "state.json"),
+    forumQueue: path.join(root, "forum-queue.json"),
     sessions: path.join(root, "sessions.json"),
     logs: path.join(root, "logs"),
     media: path.join(root, "media"),

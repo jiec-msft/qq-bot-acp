@@ -55,6 +55,24 @@ export interface QQStreamMessageResponse {
   pendingCharacters?: number;
 }
 
+export interface QQPublishForumThreadInput {
+  channelId: string;
+  title: string;
+  content: string;
+  format: 3;
+}
+
+export interface QQPublishForumThreadResponse {
+  taskId: string;
+  createTime: string;
+}
+
+export interface QQForumThreadSummary {
+  threadId: string;
+  title: unknown;
+  content: unknown;
+}
+
 export type QQPanelScope = "c2c" | "group" | "channel" | "dm";
 
 export interface QQPanelItem {
@@ -287,6 +305,67 @@ export class QQApi {
     if (!response.ok) throw qqApiError("panel update", response, result);
   }
 
+  async publishForumThread(
+    input: QQPublishForumThreadInput,
+  ): Promise<QQPublishForumThreadResponse> {
+    const response = await this.request(
+      `/channels/${encodeURIComponent(input.channelId)}/threads`,
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          title: input.title,
+          content: input.content,
+          format: input.format,
+        }),
+      },
+    );
+    const result = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!response.ok) {
+      throw qqApiError("forum thread publish", response, result);
+    }
+    const taskId = String(result.task_id ?? "");
+    if (!taskId) {
+      throw new QQApiError(
+        "forum thread publish confirmation",
+        response.status,
+        "missing-task-id",
+      );
+    }
+    return {
+      taskId,
+      createTime: String(result.create_time ?? ""),
+    };
+  }
+
+  async listForumThreads(
+    channelId: string,
+  ): Promise<QQForumThreadSummary[]> {
+    const response = await this.request(
+      `/channels/${encodeURIComponent(channelId)}/threads`,
+      { method: "GET" },
+    );
+    const result = (await response.json().catch(() => ({}))) as Record<
+      string,
+      unknown
+    >;
+    if (!response.ok) {
+      throw qqApiError("forum thread list", response, result);
+    }
+    if (!Array.isArray(result.threads)) return [];
+    return result.threads.flatMap((value) => {
+      const thread = asRecord(value);
+      const info = asRecord(thread.thread_info);
+      const threadId = String(info.thread_id ?? "");
+      if (!threadId) return [];
+      return [{
+        threadId,
+        title: info.title ?? "",
+        content: info.content ?? "",
+      }];
+    });
+  }
+
   private async request(endpoint: string, init: RequestInit, retry = true): Promise<Response> {
     const token = await this.getAccessToken();
     const response = await fetch(`${API_BASE_URL}${endpoint}`, {
@@ -450,4 +529,10 @@ function confirmedMessageId(
 function diagnosticValue(value: string): string | undefined {
   const normalized = value.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
   return normalized ? normalized.slice(0, 300) : undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null
+    ? value as Record<string, unknown>
+    : {};
 }

@@ -2,12 +2,20 @@ import path from "node:path";
 import { z } from "zod";
 
 const nonEmptyString = z.string().trim().min(1);
+const guildId = z.string().trim().regex(/^\d+$/, "Expected a numeric QQ guild ID");
 
 export const botConfigSchema = z.object({
   version: z.literal(1),
   qq: z.object({
     appId: nonEmptyString,
     clientSecretFile: nonEmptyString,
+    forum: z.object({
+      enabled: z.boolean().default(false),
+      guildAllowFrom: z.array(guildId).default([]),
+    }).default({
+      enabled: false,
+      guildAllowFrom: [],
+    }),
   }),
   agent: z.object({
     command: nonEmptyString,
@@ -55,6 +63,10 @@ export function createInitialConfig(input: {
     qq: {
       appId: input.appId,
       clientSecretFile: path.resolve(input.clientSecretFile),
+      forum: {
+        enabled: false,
+        guildAllowFrom: [],
+      },
     },
     agent: {
       command: input.agentCommand,
